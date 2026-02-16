@@ -683,18 +683,26 @@ def find_similar_memories(
                                    if n not in result_content}
 
                     if novel_names:
-                        # Score candidates by how many novel entity names they contain
+                        # Score candidates by how many novel entity names they contain.
+                        # Only consider candidates that mention at least one query term
+                        # — the injection should bring in relevant novel content, not
+                        # random memories that happen to mention many entity names.
+                        query_terms = [t.lower() for t in query.split() if len(t) >= 3]
                         best_candidate = None
-                        best_count = 0
+                        best_score = (0, 0)  # (novel_count, query_term_count)
 
                         for gm in graph_only:
                             content_lower = gm.get('content', '').lower()
-                            count = sum(1 for n in novel_names if n in content_lower)
-                            if count > best_count:
-                                best_count = count
+                            query_count = sum(1 for t in query_terms if t in content_lower)
+                            if query_terms and query_count == 0:
+                                continue  # Skip candidates irrelevant to the query
+                            novel_count = sum(1 for n in novel_names if n in content_lower)
+                            score = (novel_count, query_count)
+                            if score > best_score:
+                                best_score = score
                                 best_candidate = gm
 
-                        if best_candidate and best_count > 0:
+                        if best_candidate and best_score[0] > 0:
                             result[-1] = best_candidate
 
         # Clean up internal scoring fields
@@ -1629,16 +1637,47 @@ def add_relationship(
     source: Optional[str] = None,
     metadata: Optional[dict] = None
 ) -> str:
-    """Add a temporal relationship between entities."""
+    """Add a temporal relationship between entities.
+
+    Deduplicates: if an active relationship with the same (subject_id, predicate, object_id)
+    or (subject_id, predicate, object_value) already exists, updates confidence if higher
+    and returns the existing relationship ID instead of creating a duplicate.
+    """
     if object_id is None and object_value is None:
         raise ValueError("Must provide either object_id or object_value")
-
-    rel_id = f"rel_{uuid.uuid4().hex[:12]}"
 
     if valid_from is None:
         valid_from = datetime.now(timezone.utc).isoformat()
 
     with _db() as db:
+        # Check for existing active relationship with same triple
+        if object_id is not None:
+            existing = db.execute("""
+                SELECT id, confidence FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND object_id = ?
+                AND valid_to IS NULL
+                LIMIT 1
+            """, (subject_id, predicate, object_id)).fetchone()
+        else:
+            existing = db.execute("""
+                SELECT id, confidence FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND object_value = ?
+                AND valid_to IS NULL
+                LIMIT 1
+            """, (subject_id, predicate, object_value)).fetchone()
+
+        if existing:
+            # Already exists — update confidence if new is higher
+            if confidence > existing["confidence"]:
+                db.execute(
+                    "UPDATE relationships SET confidence = ? WHERE id = ?",
+                    (confidence, existing["id"])
+                )
+                db.commit()
+            return existing["id"]
+
+        # No existing match — insert new
+        rel_id = f"rel_{uuid.uuid4().hex[:12]}"
         db.execute("""
             INSERT INTO relationships
             (id, subject_id, predicate, object_id, object_value, valid_from, confidence, source, metadata)

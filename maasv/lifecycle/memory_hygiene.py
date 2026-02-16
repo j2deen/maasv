@@ -27,6 +27,8 @@ class HygieneStats:
     duplicates_merged: int = 0
     stale_found: int = 0
     stale_pruned: int = 0
+    rel_duplicates_found: int = 0
+    rel_duplicates_removed: int = 0
     clusters_found: int = 0
     clusters_consolidated: int = 0
     errors: list = field(default_factory=list)
@@ -108,7 +110,22 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
         stats.completed_at = datetime.now().isoformat()
         return {"stats": _stats_to_dict(stats), "cancelled": True}
 
-    # Step 3: Consolidate (only in full mode, expensive)
+    # Step 3: Deduplicate relationships
+    if not cancel_check():
+        try:
+            rel_dedup_stats = _deduplicate_relationships(dry_run)
+            stats.rel_duplicates_found = rel_dedup_stats["found"]
+            stats.rel_duplicates_removed = rel_dedup_stats["removed"]
+            logger.info(f"[MemoryHygiene] Rel dedup: found {stats.rel_duplicates_found} groups, removed {stats.rel_duplicates_removed}")
+        except Exception as e:
+            logger.error(f"[MemoryHygiene] Relationship dedup failed: {e}", exc_info=True)
+            stats.errors.append(f"Relationship dedup error: {e}")
+
+    if cancel_check():
+        stats.completed_at = datetime.now().isoformat()
+        return {"stats": _stats_to_dict(stats), "cancelled": True}
+
+    # Step 4: Consolidate (only in full mode, expensive)
     if do_consolidate and mode == "full" and not cancel_check():
         try:
             consolidate_stats = _consolidate_clusters(dry_run, cancel_check)
@@ -486,6 +503,84 @@ def _prune_stale_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
                 db.execute("DELETE FROM memory_vectors WHERE id = ?", (mem["id"],))
                 db.execute("DELETE FROM memories WHERE id = ?", (mem["id"],))
                 stats["pruned"] += 1
+
+        if not dry_run:
+            db.commit()
+
+    finally:
+        db.close()
+
+    return stats
+
+
+def _deduplicate_relationships(dry_run: bool) -> dict:
+    """
+    Remove duplicate relationships — same (subject_id, predicate, object_id) or
+    (subject_id, predicate, object_value) with multiple active rows.
+
+    Keeps the row with highest confidence per group, deletes the rest.
+    """
+    from maasv.core.store import get_db
+
+    stats = {"found": 0, "removed": 0}
+    db = get_db()
+
+    try:
+        # Entity-to-entity duplicates
+        groups = db.execute("""
+            SELECT subject_id, predicate, object_id, count(*) as cnt
+            FROM relationships
+            WHERE valid_to IS NULL AND object_id IS NOT NULL
+            GROUP BY subject_id, predicate, object_id
+            HAVING count(*) > 1
+        """).fetchall()
+
+        stats["found"] += len(groups)
+
+        for g in groups:
+            rows = db.execute("""
+                SELECT id, confidence FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND object_id = ?
+                AND valid_to IS NULL
+                ORDER BY confidence DESC, created_at ASC
+            """, (g["subject_id"], g["predicate"], g["object_id"])).fetchall()
+
+            if len(rows) < 2:
+                continue
+
+            to_delete = [row["id"] for row in rows[1:]]
+            if not dry_run:
+                placeholders = ",".join("?" * len(to_delete))
+                db.execute(f"DELETE FROM relationships WHERE id IN ({placeholders})", to_delete)
+            stats["removed"] += len(to_delete)
+
+        # Attribute-value duplicates
+        val_groups = db.execute("""
+            SELECT subject_id, predicate, object_value, count(*) as cnt
+            FROM relationships
+            WHERE valid_to IS NULL AND object_id IS NULL AND object_value IS NOT NULL
+            GROUP BY subject_id, predicate, object_value
+            HAVING count(*) > 1
+        """).fetchall()
+
+        stats["found"] += len(val_groups)
+
+        for g in val_groups:
+            rows = db.execute("""
+                SELECT id, confidence FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND object_value = ?
+                AND valid_to IS NULL AND object_id IS NULL
+                ORDER BY confidence DESC, created_at ASC
+            """, (g["subject_id"], g["predicate"], g["object_value"])).fetchall()
+
+            if len(rows) < 2:
+                continue
+
+            to_delete = [row["id"] for row in rows[1:]]
+            if not dry_run:
+                placeholders = ",".join("?" * len(to_delete))
+                db.execute(f"DELETE FROM relationships WHERE id IN ({placeholders})", to_delete)
+            stats["removed"] += len(to_delete)
 
         if not dry_run:
             db.commit()
