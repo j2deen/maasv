@@ -7,12 +7,15 @@ Hybrid approach: vector embeddings for fuzzy matching, FTS5 for keywords.
 All database paths and embedding calls come from the initialized config/providers.
 """
 
+import logging
 import sqlite3
 import json
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Callable
+
+logger = logging.getLogger(__name__)
 
 
 def _get_db_path():
@@ -49,6 +52,52 @@ def _db():
         yield db
     finally:
         db.close()
+
+
+def _ensure_migration_table(db: sqlite3.Connection):
+    """Create the schema_migrations tracking table if it doesn't exist."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.commit()
+
+
+def run_migration(db: sqlite3.Connection, version: int, description: str, migrate_fn: Callable[[sqlite3.Connection], None]):
+    """
+    Run a schema migration if it hasn't been applied yet.
+
+    Checks schema_migrations for the version. If not present, runs migrate_fn
+    inside a transaction and records the version. If already applied, skips silently.
+
+    Args:
+        db: Open database connection (with sqlite-vec loaded)
+        version: Integer migration version (must be unique, monotonically increasing)
+        description: Human-readable description of what this migration does
+        migrate_fn: Callable that takes a db connection and performs the migration
+    """
+    existing = db.execute(
+        "SELECT version FROM schema_migrations WHERE version = ?", (version,)
+    ).fetchone()
+    if existing:
+        return
+
+    logger.info(f"Running migration {version}: {description}")
+    try:
+        migrate_fn(db)
+        db.execute(
+            "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
+            (version, description)
+        )
+        db.commit()
+        logger.info(f"Migration {version} applied successfully")
+    except Exception:
+        db.rollback()
+        logger.error(f"Migration {version} failed, rolled back", exc_info=True)
+        raise
 
 
 def init_db():
@@ -189,6 +238,34 @@ def init_db():
     """)
 
     db.commit()
+
+    # --- Migration tracking and schema migrations ---
+    _ensure_migration_table(db)
+
+    # Version 0: Mark the Phase 0 baseline as tracked
+    run_migration(db, 0, "Phase 0 baseline", lambda _db: None)
+
+    # Version 1: Bitemporal columns
+    def _migrate_bitemporal(db: sqlite3.Connection):
+        db.execute("ALTER TABLE memories ADD COLUMN ingested_at TEXT DEFAULT NULL")
+        db.execute("UPDATE memories SET ingested_at = created_at WHERE ingested_at IS NULL")
+        db.execute("ALTER TABLE relationships ADD COLUMN ingested_at TEXT DEFAULT NULL")
+        db.execute("UPDATE relationships SET ingested_at = created_at WHERE ingested_at IS NULL")
+        db.execute("ALTER TABLE relationships ADD COLUMN change_reason TEXT DEFAULT NULL")
+
+    run_migration(db, 1, "Bitemporal columns (ingested_at, change_reason)", _migrate_bitemporal)
+
+    # Version 2: Importance scoring + decay columns
+    def _migrate_importance(db: sqlite3.Connection):
+        db.execute("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5")
+        db.execute("ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0")
+        db.execute("ALTER TABLE memories ADD COLUMN last_accessed_at TEXT DEFAULT NULL")
+        # Backfill: family/identity = 1.0, decision = 0.8
+        db.execute("UPDATE memories SET importance = 1.0 WHERE category IN ('family', 'identity')")
+        db.execute("UPDATE memories SET importance = 0.8 WHERE category = 'decision'")
+
+    run_migration(db, 2, "Importance scoring + decay columns", _migrate_importance)
+
     db.close()
 
 
@@ -197,15 +274,59 @@ def init_db():
 # ============================================================================
 
 def get_embedding(text: str) -> list[float]:
-    """Get embedding vector for text via the configured EmbedProvider."""
+    """Get embedding vector for a document/memory via the configured EmbedProvider."""
     import maasv
     return maasv.get_embed().embed(text)
+
+
+def get_query_embedding(text: str) -> list[float]:
+    """Get embedding vector for a search query (may use instruction prefix)."""
+    import maasv
+    return maasv.get_embed().embed_query(text)
 
 
 def serialize_embedding(embedding: list[float]) -> bytes:
     """Convert embedding to binary format for sqlite-vec."""
     from sqlite_vec import serialize_float32
     return serialize_float32(embedding)
+
+
+# ============================================================================
+# ACCESS TRACKING
+# ============================================================================
+
+def _record_memory_access(db: sqlite3.Connection, memory_ids: list[str]):
+    """Increment access_count and set last_accessed_at for retrieved memories."""
+    if not memory_ids:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    placeholders = ",".join("?" * len(memory_ids))
+    try:
+        db.execute(
+            f"UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [now] + memory_ids
+        )
+        db.commit()
+    except Exception:
+        logger.warning("Failed to record memory access", exc_info=True)
+
+
+def _record_entity_access(db: sqlite3.Connection, entity_ids: list[str]):
+    """Increment access_count and set last_accessed_at for retrieved entities."""
+    if not entity_ids:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    placeholders = ",".join("?" * len(entity_ids))
+    try:
+        db.execute(
+            f"UPDATE entities SET access_count = access_count + 1, last_accessed_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [now] + entity_ids
+        )
+        db.commit()
+    except Exception:
+        logger.warning("Failed to record entity access", exc_info=True)
 
 
 # ============================================================================
@@ -299,8 +420,21 @@ def find_similar_memories(
     category: Optional[str] = None,
     subject: Optional[str] = None
 ) -> list[dict]:
-    """Find memories similar to query using vector search."""
-    query_embedding = get_embedding(query)
+    """
+    Find memories similar to query using vector search with importance-weighted reranking.
+
+    Over-retrieves by 3x, then reranks using:
+        score = (1 - distance) * importance * decay_factor * log(2 + access_count)
+
+    Protected categories (family, identity) are exempt from time decay.
+    Optionally filters by category and/or subject.
+    """
+    import math
+
+    query_embedding = get_query_embedding(query)
+
+    # Over-retrieve 3x candidates for reranking
+    fetch_limit = limit * 3
 
     sql = """
         SELECT
@@ -311,6 +445,8 @@ def find_similar_memories(
             m.confidence,
             m.created_at,
             m.metadata,
+            m.importance,
+            m.access_count,
             distance
         FROM memory_vectors v
         JOIN memories m ON v.id = m.id
@@ -320,10 +456,51 @@ def find_similar_memories(
         ORDER BY distance
     """
 
-    with _db() as db:
-        rows = db.execute(sql, (serialize_embedding(query_embedding), limit)).fetchall()
+    import maasv
+    protected = maasv.get_config().protected_categories
+    now = datetime.now(timezone.utc)
 
-    return [dict(row) for row in rows]
+    with _db() as db:
+        rows = db.execute(sql, (serialize_embedding(query_embedding), fetch_limit)).fetchall()
+        candidates = [dict(row) for row in rows]
+
+        # Filter by category/subject if specified
+        if category:
+            candidates = [c for c in candidates if c['category'] == category]
+        if subject:
+            candidates = [c for c in candidates if c.get('subject') and subject.lower() in c['subject'].lower()]
+
+        # Rerank by importance-weighted score
+        for mem in candidates:
+            distance = mem.get('distance', 1.0)
+            importance = mem.get('importance') or 0.5
+            access_count = mem.get('access_count') or 0
+
+            # Decay: protected categories don't decay
+            if mem.get('category') in protected:
+                decay_factor = 1.0
+            else:
+                try:
+                    created = datetime.fromisoformat(mem['created_at'])
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    days_old = (now - created).total_seconds() / 86400
+                except (ValueError, TypeError):
+                    days_old = 0
+                decay_factor = math.exp(-days_old / 180)
+
+            mem['_score'] = (1 - distance) * importance * decay_factor * math.log(2 + access_count)
+
+        candidates.sort(key=lambda m: m['_score'], reverse=True)
+        result = candidates[:limit]
+
+        # Clean up internal scoring field
+        for mem in result:
+            del mem['_score']
+
+        _record_memory_access(db, [r['id'] for r in result])
+
+    return result
 
 
 def find_by_subject(subject: str, active_only: bool = True) -> list[dict]:
@@ -550,7 +727,7 @@ def get_core_memories(refresh: bool = False) -> list[dict]:
 
     with _db() as db:
         rows = db.execute("""
-            SELECT id, content, category, subject, confidence, created_at
+            SELECT id, content, category, subject, confidence, created_at, importance
             FROM memories
             WHERE superseded_by IS NULL
             AND category IN ('family', 'identity', 'preference')
@@ -560,6 +737,7 @@ def get_core_memories(refresh: bool = False) -> list[dict]:
                     WHEN 'identity' THEN 2
                     WHEN 'preference' THEN 3
                 END,
+                importance DESC,
                 created_at DESC
         """).fetchall()
 
@@ -696,11 +874,12 @@ def find_entity_by_name(name: str, entity_type: Optional[str] = None) -> Optiona
                 (canonical,)
             ).fetchone()
 
-    if row:
-        result = dict(row)
-        if result.get('metadata'):
-            result['metadata'] = json.loads(result['metadata'])
-        return result
+        if row:
+            result = dict(row)
+            _record_entity_access(db, [result['id']])
+            if result.get('metadata'):
+                result['metadata'] = json.loads(result['metadata'])
+            return result
     return None
 
 
@@ -895,7 +1074,92 @@ def get_entity_relationships(
                     results.append(row_dict)
                     seen_ids.add(row_dict['id'])
 
+        # Track access on the queried entity itself
+        _record_entity_access(db, [entity_id])
+
     return results
+
+
+# Causal predicate sets for chain traversal
+_FORWARD_CAUSAL = {"led_to", "resulted_in", "enabled_by"}
+_BACKWARD_CAUSAL = {"caused_by", "motivated_by", "blocked_by"}
+_ALL_CAUSAL = _FORWARD_CAUSAL | _BACKWARD_CAUSAL | {"chose_over"}
+
+
+def get_causal_chain(
+    entity_id: str,
+    direction: str = "both",
+    max_hops: int = 3
+) -> list[dict]:
+    """
+    Traverse causal edges from an entity.
+
+    Args:
+        entity_id: Starting entity
+        direction: "forward" (led_to, resulted_in, enabled_by),
+                   "backward" (caused_by, motivated_by, blocked_by),
+                   or "both"
+        max_hops: Maximum traversal depth
+
+    Returns:
+        Ordered list of {"entity": {...}, "relationship": {...}, "hop": int}
+    """
+    if direction == "forward":
+        predicates = _FORWARD_CAUSAL
+    elif direction == "backward":
+        predicates = _BACKWARD_CAUSAL
+    else:
+        predicates = _ALL_CAUSAL
+
+    chain = []
+    visited = {entity_id}
+    frontier = [entity_id]
+
+    with _db() as db:
+        for hop in range(1, max_hops + 1):
+            next_frontier = []
+            for current_id in frontier:
+                placeholders = ",".join("?" * len(predicates))
+                rows = db.execute(f"""
+                    SELECT r.*,
+                           e.id as next_entity_id, e.name as next_entity_name,
+                           e.entity_type as next_entity_type
+                    FROM relationships r
+                    JOIN entities e ON (
+                        CASE WHEN r.subject_id = ? THEN r.object_id ELSE r.subject_id END
+                    ) = e.id
+                    WHERE (r.subject_id = ? OR r.object_id = ?)
+                    AND r.predicate IN ({placeholders})
+                    AND r.valid_to IS NULL
+                """, [current_id, current_id, current_id] + list(predicates)).fetchall()
+
+                for row in rows:
+                    row_dict = dict(row)
+                    next_id = row_dict['next_entity_id']
+                    if next_id and next_id not in visited:
+                        visited.add(next_id)
+                        next_frontier.append(next_id)
+                        chain.append({
+                            "entity": {
+                                "id": next_id,
+                                "name": row_dict['next_entity_name'],
+                                "type": row_dict['next_entity_type'],
+                            },
+                            "relationship": {
+                                "id": row_dict['id'],
+                                "predicate": row_dict['predicate'],
+                                "subject_id": row_dict['subject_id'],
+                                "object_id": row_dict['object_id'],
+                                "confidence": row_dict['confidence'],
+                            },
+                            "hop": hop,
+                        })
+
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    return chain
 
 
 def update_relationship_value(

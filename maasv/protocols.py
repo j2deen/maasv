@@ -40,7 +40,7 @@ class EmbedProvider(Protocol):
 
     def embed(self, text: str) -> list[float]:
         """
-        Get embedding vector for text.
+        Get embedding vector for a document/memory (storage, dedup, hygiene).
 
         Args:
             text: The text to embed
@@ -49,3 +49,12 @@ class EmbedProvider(Protocol):
             Embedding vector as list of floats
         """
         ...
+
+    def embed_query(self, text: str) -> list[float]:
+        """
+        Get embedding vector for a search query.
+
+        Some models (e.g., Qwen3-Embedding) use different formatting for
+        queries vs documents. Default implementation falls back to embed().
+        """
+        return self.embed(text)

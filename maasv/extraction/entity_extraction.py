@@ -34,7 +34,14 @@ PREDICATE_OBJECT_TYPE = {
     "works_at": "organization",
     "parent_of": "person", "child_of": "person", "married_to": "person",
     "sibling_of": "person", "friend_of": "person", "works_with": "person", "colleague_of": "person",
+    # Causal predicates — any entity type
+    "caused_by": None, "led_to": None, "resulted_in": None,
+    "motivated_by": None, "enabled_by": None, "blocked_by": None, "chose_over": None,
 }
+
+# Causal predicates require higher confidence to avoid hallucination
+CAUSAL_PREDICATES = {"caused_by", "led_to", "resulted_in", "motivated_by", "enabled_by", "blocked_by", "chose_over"}
+CAUSAL_MIN_CONFIDENCE = 0.8
 
 PREDICATE_SUBJECT_TYPE = {
     "located_in": "place",
@@ -113,6 +120,9 @@ Relationship predicates:
 - works_at, works_on, manages (professional)
 - located_in, visited, lives_in (location)
 - has_email, has_phone, has_birthday (attributes - object_is_entity: false)
+- caused_by, led_to, resulted_in (causal — only when clearly stated, confidence 0.9+)
+- motivated_by, enabled_by, blocked_by (causal reasoning)
+- chose_over (decisions — subject chose X over object)
 
 IMPORTANT:
 - Only extract entities with PROPER NAMES
@@ -256,7 +266,9 @@ class EntityExtractor:
 
             if not subject_name or not predicate or not object_name:
                 continue
-            if confidence < 0.5:
+            # Causal predicates require higher confidence to avoid hallucination
+            min_confidence = CAUSAL_MIN_CONFIDENCE if predicate in CAUSAL_PREDICATES else 0.5
+            if confidence < min_confidence:
                 continue
 
             try:
