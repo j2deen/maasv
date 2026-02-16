@@ -421,21 +421,18 @@ def find_similar_memories(
     subject: Optional[str] = None
 ) -> list[dict]:
     """
-    Find memories using 3-signal retrieval with importance-weighted reranking.
+    Find memories using 3-signal retrieval with cross-encoder reranking.
 
     Pipeline:
-    1. Dense vector similarity → top N candidates (primary signal)
+    1. Dense vector similarity → top N candidates
     2. BM25 keyword matching (FTS5) → top N candidates
     3. Graph connectivity (entity mentions → subject match) → top N candidates
-    4. RRF fusion → unified candidate pool (deduped)
+    4. RRF fusion → unified candidate pool
     5. Filter by category/subject (if specified)
-    6. Split: primary (vector-retrieved) scored with Phase 1 importance formula,
-       supplementary (BM25/graph-only) scored separately
-    7. Primary results first, supplementary fills remaining slots
+    6. Cross-encoder reranking (query-document relevance scoring)
+       Fallback: importance-weighted formula if cross-encoder unavailable
+    7. Diversity-aware selection (Jaccard dedup)
     8. Record access
-
-    Multi-signal agreement: primary results found by multiple signals get a
-    small additive bonus. Protected categories (family, identity) exempt from decay.
     """
     import math
     import re
@@ -493,108 +490,217 @@ def find_similar_memories(
         if subject:
             candidates = [c for c in candidates if c.get('subject') and subject.lower() in c['subject'].lower()]
 
-        # === Importance-weighted reranking ===
-        # Strategy: vector distance is primary quality signal (Phase 1 formula).
-        # BM25/graph agreement provides a multiplicative boost.
-        # Non-vector results are scored separately and appended as diversity fills.
+        # === Reranking ===
+        # Try cross-encoder first (best quality). Falls back to importance-weighted
+        # formula if cross-encoder is unavailable.
+        from maasv.core.reranker import rerank as ce_rerank
+        ce_scores = ce_rerank(query, candidates)
+
         vector_distances = {r['id']: r['distance'] for r in vector_results}
         bm25_ids = {r['id'] for r in bm25_results}
         graph_ids = {r['id'] for r in graph_results}
 
-        primary = []    # Vector-retrieved candidates (scored with distance)
-        supplementary = []  # BM25/graph-only candidates (scored by importance)
+        if ce_scores is not None:
+            # === Two-stage reranking ===
+            # Stage 1: Score with proven importance formula (9/10 baseline).
+            # Stage 2: CE reshuffles within top tier only.
+            #
+            # The MS MARCO cross-encoder prefers short exact matches over
+            # informationally rich memories. Pure CE scoring regresses quality
+            # because it displaces well-established, high-access memories with
+            # semantically precise but shallow matches. Two-stage prevents this:
+            # importance determines WHICH memories are candidates, CE only
+            # refines the ORDER within that set.
 
-        for mem in candidates:
-            importance = mem.get('importance') or 0.5
-            access_count = mem.get('access_count') or 0
+            # Stage 1: importance scoring (same as fallback path)
+            primary = []
+            supplementary = []
 
-            # Decay: protected categories don't decay
-            if mem.get('category') in protected:
-                decay_factor = 1.0
-            else:
-                try:
-                    created = datetime.fromisoformat(mem['created_at'])
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=timezone.utc)
-                    days_old = (now - created).total_seconds() / 86400
-                except (ValueError, TypeError):
-                    days_old = 0
-                decay_factor = math.exp(-days_old / 180)
+            for mem in candidates:
+                imp = mem.get('importance') or 0.5
+                acc = mem.get('access_count') or 0
 
-            # Dampen access_count to prevent feedback loops: frequently-retrieved
-            # memories would otherwise snowball (acc=7 → 3.17x boost over acc=0).
-            # Cap at 5 accesses (max 2.81x boost) so new/rare memories can compete.
-            dampened_access = min(access_count, 5)
+                if mem.get('category') in protected:
+                    decay = 1.0
+                else:
+                    try:
+                        created = datetime.fromisoformat(mem['created_at'])
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        days_old = (now - created).total_seconds() / 86400
+                    except (ValueError, TypeError):
+                        days_old = 0
+                    decay = math.exp(-days_old / 180)
 
-            distance = vector_distances.get(mem['id'])
-            if distance is not None:
-                # Primary: scored with Phase 1 formula.
-                # (1 - distance) can be negative for cosine dist > 1.0 — that's fine,
-                # negative scores still rank correctly relative to other vector results.
-                base_score = (1.0 - distance) * importance * decay_factor * math.log(2 + dampened_access)
+                dampened = min(acc, 5)
+                distance = vector_distances.get(mem['id'])
 
-                # Multi-signal agreement boost: memories found by multiple signals
-                # get an additive bonus (not multiplicative — multiplying negative
-                # scores would invert the ranking).
-                signal_count = 1  # already in vector
-                if mem['id'] in bm25_ids:
-                    signal_count += 1
-                if mem['id'] in graph_ids:
-                    signal_count += 1
-                agreement_bonus = (signal_count - 1) * 0.01
+                if distance is not None:
+                    base = (1.0 - distance) * imp * decay * math.log(2 + dampened)
+                    sc = 1
+                    if mem['id'] in bm25_ids:
+                        sc += 1
+                    if mem['id'] in graph_ids:
+                        sc += 1
+                    mem['_imp_score'] = base + (sc - 1) * 0.01
+                    primary.append(mem)
+                else:
+                    mem['_imp_score'] = imp * decay * math.log(2 + dampened) * 0.0001
+                    supplementary.append(mem)
 
-                mem['_score'] = base_score + agreement_bonus
-                primary.append(mem)
-            else:
-                # Supplementary: found only by BM25/graph, no vector match.
-                # These fill remaining slots after all vector results.
-                mem['_score'] = importance * decay_factor * math.log(2 + dampened_access) * 0.0001
-                supplementary.append(mem)
+            primary.sort(key=lambda m: m['_imp_score'], reverse=True)
+            supplementary.sort(key=lambda m: m['_imp_score'], reverse=True)
 
-        # Sort each group independently
-        primary.sort(key=lambda m: m['_score'], reverse=True)
-        supplementary.sort(key=lambda m: m['_score'], reverse=True)
+            # Stage 2: CE reranks the top tier (2x limit from primary + supplementary)
+            # This gives the CE room to improve ordering without displacing
+            # well-ranked memories from outside the window.
+            rerank_size = min(limit * 2, len(primary) + len(supplementary))
+            importance_ranked = (primary + supplementary)[:rerank_size]
+
+            # Map CE scores to this subset by memory ID
+            ce_score_map = {}
+            for mem, score in zip(candidates, ce_scores):
+                ce_score_map[mem['id']] = score
+
+            def _sigmoid(x):
+                if x >= 0:
+                    return 1.0 / (1.0 + math.exp(-x))
+                exp_x = math.exp(x)
+                return exp_x / (1.0 + exp_x)
+
+            # Min-max normalize importance scores within the rerank window
+            imp_scores = [m['_imp_score'] for m in importance_ranked]
+            imp_min = min(imp_scores) if imp_scores else 0
+            imp_max = max(imp_scores) if imp_scores else 1
+            imp_range = imp_max - imp_min if imp_max > imp_min else 1.0
+
+            for mem in importance_ranked:
+                ce_raw = ce_score_map.get(mem['id'], 0.0)
+                ce_norm = _sigmoid(ce_raw)
+                imp_norm = (mem['_imp_score'] - imp_min) / imp_range
+
+                # Importance-dominant blend: CE is a tiebreaker, not the decider.
+                # 0.75 importance + 0.25 CE ensures the existing 9/10 baseline
+                # is preserved while CE can swap close-ranked candidates.
+                mem['_score'] = 0.75 * imp_norm + 0.25 * ce_norm
+
+            importance_ranked.sort(key=lambda m: m['_score'], reverse=True)
+
+            # Append any remaining candidates after the rerank window
+            reranked_ids = {m['id'] for m in importance_ranked}
+            remainder = [m for m in (primary + supplementary)[rerank_size:]
+                         if m['id'] not in reranked_ids]
+            scored_pool = importance_ranked + remainder
+        else:
+            # === Fallback: importance-weighted reranking (Phase 1 formula) ===
+            primary = []
+            supplementary = []
+
+            for mem in candidates:
+                importance = mem.get('importance') or 0.5
+                access_count = mem.get('access_count') or 0
+
+                if mem.get('category') in protected:
+                    decay_factor = 1.0
+                else:
+                    try:
+                        created = datetime.fromisoformat(mem['created_at'])
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        days_old = (now - created).total_seconds() / 86400
+                    except (ValueError, TypeError):
+                        days_old = 0
+                    decay_factor = math.exp(-days_old / 180)
+
+                dampened_access = min(access_count, 5)
+
+                distance = vector_distances.get(mem['id'])
+                if distance is not None:
+                    base_score = (1.0 - distance) * importance * decay_factor * math.log(2 + dampened_access)
+                    signal_count = 1
+                    if mem['id'] in bm25_ids:
+                        signal_count += 1
+                    if mem['id'] in graph_ids:
+                        signal_count += 1
+                    agreement_bonus = (signal_count - 1) * 0.01
+                    mem['_score'] = base_score + agreement_bonus
+                    primary.append(mem)
+                else:
+                    mem['_score'] = importance * decay_factor * math.log(2 + dampened_access) * 0.0001
+                    supplementary.append(mem)
+
+            primary.sort(key=lambda m: m['_score'], reverse=True)
+            supplementary.sort(key=lambda m: m['_score'], reverse=True)
+            scored_pool = primary + supplementary
 
         # === Diversity-aware selection (MMR-inspired) ===
-        # Greedily select from primary, skipping candidates too similar to
-        # already-selected results. This prevents near-duplicate memories
-        # (e.g., 5 copies of "Adam has a Mac Mini") from filling all slots.
-        # Similarity is measured by word overlap (Jaccard). Threshold adapts:
-        # short memories (< 12 words) use 0.5 (they're easily near-duplicates),
-        # longer memories use 0.7 (more content means legitimate diversity).
+        # Greedily select from scored candidates, skipping those too similar to
+        # already-selected results. Prevents near-duplicate memories from filling
+        # all slots. Threshold adapts: short memories (< 12 words) use 0.5,
+        # longer memories use 0.7.
         result = []
-        selected_words = []  # list of word-sets for selected results
+        selected_words = []
 
-        for pool in [primary, supplementary]:
+        for mem in scored_pool:
             if len(result) >= limit:
                 break
-            for mem in pool:
-                if len(result) >= limit:
+            mem_words = set(re.findall(r'\w+', mem.get('content', '').lower()))
+            threshold = 0.5 if len(mem_words) < 12 else 0.7
+            is_diverse = True
+            for sw in selected_words:
+                if not mem_words or not sw:
+                    continue
+                intersection = len(mem_words & sw)
+                union = len(mem_words | sw)
+                jaccard = intersection / union if union > 0 else 0
+                smaller = min(len(mem_words), len(sw))
+                containment = intersection / smaller if smaller > 0 else 0
+                if jaccard > threshold or containment > 0.8:
+                    is_diverse = False
                     break
-                # Check diversity: is this too similar to any selected result?
-                mem_words = set(re.findall(r'\w+', mem.get('content', '').lower()))
-                threshold = 0.5 if len(mem_words) < 12 else 0.7
-                is_diverse = True
-                for sw in selected_words:
-                    if not mem_words or not sw:
-                        continue
-                    intersection = len(mem_words & sw)
-                    union = len(mem_words | sw)
-                    jaccard = intersection / union if union > 0 else 0
-                    # Also check asymmetric containment: if one memory's words
-                    # are mostly a subset of another, it's redundant
-                    smaller = min(len(mem_words), len(sw))
-                    containment = intersection / smaller if smaller > 0 else 0
-                    if jaccard > threshold or containment > 0.8:
-                        is_diverse = False
-                        break
-                if is_diverse:
-                    result.append(mem)
-                    selected_words.append(mem_words)
+            if is_diverse:
+                result.append(mem)
+                selected_words.append(mem_words)
+
+        # === Graph slot injection ===
+        # If the graph signal found content (via 1-hop expansion) that didn't
+        # make it into the top results, inject the graph result that mentions
+        # the most graph-connected entity names. This ensures graph-discovered
+        # connections (e.g., Doris→FastAPI) surface even when importance scoring
+        # favors high-access vector matches.
+        if graph_results and len(result) >= limit:
+            result_ids = {m['id'] for m in result}
+            result_content = " ".join(m.get('content', '').lower() for m in result)
+            graph_only = [m for m in graph_results if m['id'] not in result_ids]
+
+            if graph_only:
+                # Get expanded entity names from graph
+                expanded_names = _get_graph_expanded_names(db, query)
+
+                if expanded_names:
+                    # Filter to entity names not already mentioned in results
+                    novel_names = {n for n in expanded_names
+                                   if n not in result_content}
+
+                    if novel_names:
+                        # Score candidates by how many novel entity names they contain
+                        best_candidate = None
+                        best_count = 0
+
+                        for gm in graph_only:
+                            content_lower = gm.get('content', '').lower()
+                            count = sum(1 for n in novel_names if n in content_lower)
+                            if count > best_count:
+                                best_count = count
+                                best_candidate = gm
+
+                        if best_candidate and best_count > 0:
+                            result[-1] = best_candidate
 
         # Clean up internal scoring fields
         for mem in result:
             mem.pop('_score', None)
+            mem.pop('_imp_score', None)
             mem.pop('rrf_score', None)
             mem.pop('bm25_score', None)
             mem.pop('graph_score', None)
@@ -658,14 +764,104 @@ def search_fts(query: str, limit: int = 10, category: Optional[str] = None) -> l
 # MULTI-SIGNAL RETRIEVAL (Phase 2)
 # ============================================================================
 
+def _query_to_entity_fts(query: str) -> str:
+    """
+    Convert a natural-language query to OR-separated FTS5 terms for entity search.
+
+    FTS5 defaults to AND, so "Doris architecture" requires both words in entity
+    names — which misses the "Doris" entity. Converting to "Doris OR architecture"
+    ensures we find entities matching ANY query term.
+
+    Strips FTS5 special characters and skips short/common words.
+    """
+    import re
+    stop_words = {"the", "a", "an", "is", "of", "in", "on", "for", "and", "or", "to", "with"}
+    words = re.findall(r'\w+', query)
+    terms = [w for w in words if len(w) > 1 and w.lower() not in stop_words]
+    if not terms:
+        return query
+    return " OR ".join(terms)
+
+
+def _expand_query_from_graph(db: sqlite3.Connection, query: str) -> str:
+    """
+    Expand a query with related entity names from the knowledge graph.
+
+    "Doris architecture" → graph says Doris uses_tech FastAPI →
+    returns "Doris architecture OR FastAPI"
+
+    This provides redundant coverage with _find_memories_by_graph():
+    if graph signal or BM25 fails independently, the other catches it.
+    """
+    import re
+
+    NOISE_PREDICATES = {"inferred_as"}
+
+    entity_fts_query = _query_to_entity_fts(query)
+    try:
+        entities = db.execute("""
+            SELECT e.id, e.name
+            FROM entities_fts f
+            JOIN entities e ON f.rowid = e.rowid
+            WHERE entities_fts MATCH ?
+            LIMIT 5
+        """, (entity_fts_query,)).fetchall()
+    except Exception:
+        return query
+
+    if not entities:
+        return query
+
+    entity_ids = [e["id"] for e in entities]
+    placeholders = ",".join("?" * len(entity_ids))
+
+    try:
+        related = db.execute(f"""
+            SELECT DISTINCT e.name
+            FROM relationships r
+            JOIN entities e ON (
+                CASE
+                    WHEN r.subject_id IN ({placeholders}) THEN r.object_id
+                    ELSE r.subject_id
+                END
+            ) = e.id
+            WHERE (r.subject_id IN ({placeholders}) OR r.object_id IN ({placeholders}))
+            AND r.valid_to IS NULL
+            AND r.predicate NOT IN ('inferred_as')
+            LIMIT 10
+        """, entity_ids * 3).fetchall()
+    except Exception:
+        return query
+
+    # Build expanded query: original OR "related term 1" OR "related term 2"
+    expansion_terms = []
+    for row in related:
+        name = row["name"]
+        if name:
+            clean = re.sub(r'[^\w\s]', '', name).strip()
+            if clean and clean.lower() not in query.lower():
+                expansion_terms.append(f'"{clean}"')
+
+    if not expansion_terms:
+        return query
+
+    # FTS5 OR syntax
+    return query + " OR " + " OR ".join(expansion_terms)
+
+
 def _find_memories_by_bm25(db: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
     """
     Return memories ranked by BM25 relevance from the FTS5 index.
 
     Uses bm25() scoring function with weights: content=10, category=1, subject=5.
     Only returns active (non-superseded) memories.
+    Expands query with graph-connected entity names before searching.
     Returns dicts with 'id' key (required for RRF) and 'bm25_score'.
     """
+    expanded_query = _expand_query_from_graph(db, query)
+    if expanded_query != query:
+        logger.debug("BM25 query expanded: %s -> %s", query, expanded_query)
+
     try:
         rows = db.execute("""
             SELECT m.id, m.content, m.category, m.subject, m.confidence,
@@ -677,37 +873,109 @@ def _find_memories_by_bm25(db: sqlite3.Connection, query: str, limit: int = 50) 
             AND m.superseded_by IS NULL
             ORDER BY bm25(memories_fts, 10.0, 1.0, 5.0)
             LIMIT ?
-        """, (query, limit)).fetchall()
+        """, (expanded_query, limit)).fetchall()
         return [dict(r) for r in rows]
     except Exception:
-        logger.debug("BM25 search failed for query: %s", query, exc_info=True)
+        logger.debug("BM25 search failed for expanded query: %s", expanded_query, exc_info=True)
+        # Fallback: try original query without expansion
+        if expanded_query != query:
+            try:
+                rows = db.execute("""
+                    SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                           m.created_at, m.metadata, m.importance, m.access_count,
+                           bm25(memories_fts, 10.0, 1.0, 5.0) as bm25_score
+                    FROM memories_fts f
+                    JOIN memories m ON f.rowid = m.rowid
+                    WHERE memories_fts MATCH ?
+                    AND m.superseded_by IS NULL
+                    ORDER BY bm25(memories_fts, 10.0, 1.0, 5.0)
+                    LIMIT ?
+                """, (query, limit)).fetchall()
+                return [dict(r) for r in rows]
+            except Exception:
+                logger.debug("BM25 fallback also failed for: %s", query, exc_info=True)
         return []
 
 
-def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
+def _get_graph_expanded_names(db: sqlite3.Connection, query: str) -> set[str]:
     """
-    Find memories connected to entities mentioned in the query.
-
-    Flow:
-    1. Match query terms against entity names via entities_fts
-    2. Find memories whose subject matches any discovered entity's canonical_name or name
-    3. Also search memory content for direct entity name mentions
-
-    Note: No hop expansion yet — direct entity matches only. Hop expansion
-    added too much noise (TerryAnn → Adam → family memories). Will add
-    weighted hop expansion in a future iteration when graph is denser.
-
-    Returns dicts with 'id' key (required for RRF) and 'graph_score'.
+    Get entity names reachable via 1-hop graph expansion from query entities.
+    Used by graph slot injection to score candidates by entity density.
     """
-    # Step 1: Find entities mentioned in the query via FTS
+    entity_fts_query = _query_to_entity_fts(query)
     try:
         entities = db.execute("""
-            SELECT e.id, e.canonical_name, e.name
+            SELECT e.id, e.name
             FROM entities_fts f
             JOIN entities e ON f.rowid = e.rowid
             WHERE entities_fts MATCH ?
             LIMIT 10
-        """, (query,)).fetchall()
+        """, (entity_fts_query,)).fetchall()
+    except Exception:
+        return set()
+
+    if not entities:
+        return set()
+
+    direct_ids = [e["id"] for e in entities]
+    direct_names = {e["name"] for e in entities if e["name"]}
+    placeholders = ",".join("?" * len(direct_ids))
+
+    expanded = set()
+    try:
+        rows = db.execute(f"""
+            SELECT DISTINCT e.name
+            FROM relationships r
+            JOIN entities e ON (
+                CASE WHEN r.subject_id IN ({placeholders}) THEN r.object_id
+                     ELSE r.subject_id END
+            ) = e.id
+            WHERE (r.subject_id IN ({placeholders}) OR r.object_id IN ({placeholders}))
+            AND r.valid_to IS NULL
+            AND r.predicate NOT IN ('inferred_as')
+            LIMIT 30
+        """, direct_ids * 3).fetchall()
+        for r in rows:
+            if r["name"] and r["name"] not in direct_names:
+                expanded.add(r["name"].lower())
+    except Exception:
+        pass
+
+    return expanded
+
+
+def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
+    """
+    Find memories connected to entities mentioned in the query via graph traversal.
+
+    Flow:
+    1. Entity FTS finds entities matching query terms
+    2. 1-hop expansion: follow non-noise relationships to related entities
+    3. Build set of all entity names (direct + 1-hop related)
+    4. Search memories_fts (FTS5) for content mentioning any entity name
+    5. Fall back to subject LIKE matching if FTS yields too few results
+
+    The 1-hop expansion is what enables "Doris architecture" → Doris entity →
+    Doris-uses_tech→FastAPI → memories mentioning "FastAPI".
+
+    Returns dicts with 'id' key (required for RRF) and 'graph_score'.
+    """
+    import re
+
+    # Noise predicates that provide no useful signal for retrieval
+    NOISE_PREDICATES = {"inferred_as"}
+
+    # Step 1: Find entities mentioned in the query via FTS
+    # Convert to OR terms so "Doris architecture" matches "Doris" entity
+    entity_fts_query = _query_to_entity_fts(query)
+    try:
+        entities = db.execute("""
+            SELECT e.id, e.canonical_name, e.name, e.entity_type
+            FROM entities_fts f
+            JOIN entities e ON f.rowid = e.rowid
+            WHERE entities_fts MATCH ?
+            LIMIT 10
+        """, (entity_fts_query,)).fetchall()
     except Exception:
         logger.debug("Entity FTS failed for query: %s", query, exc_info=True)
         return []
@@ -715,38 +983,201 @@ def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50)
     if not entities:
         return []
 
-    entity_names = set()
+    # Collect direct entity IDs and names
+    direct_entity_ids = set()
+    direct_entity_names = set()
     for e in entities:
-        if e["canonical_name"]:
-            entity_names.add(e["canonical_name"])
+        direct_entity_ids.add(e["id"])
         if e["name"]:
-            entity_names.add(e["name"].lower())
+            direct_entity_names.add(e["name"])
 
-    if not entity_names:
+    # Step 2: 1-hop expansion — follow non-noise relationships
+    # Only collect EXPANDED entity names (from related entities, not the query matches)
+    expanded_entity_names = set()
+    if direct_entity_ids:
+        placeholders = ",".join("?" * len(direct_entity_ids))
+        try:
+            related_rows = db.execute(f"""
+                SELECT DISTINCT
+                    e.name
+                FROM relationships r
+                JOIN entities e ON (
+                    CASE
+                        WHEN r.subject_id IN ({placeholders}) THEN r.object_id
+                        ELSE r.subject_id
+                    END
+                ) = e.id
+                WHERE (r.subject_id IN ({placeholders}) OR r.object_id IN ({placeholders}))
+                AND r.valid_to IS NULL
+                AND r.predicate NOT IN ('inferred_as')
+                LIMIT 20
+            """, list(direct_entity_ids) * 3).fetchall()
+
+            for row in related_rows:
+                if row["name"] and row["name"] not in direct_entity_names:
+                    expanded_entity_names.add(row["name"])
+        except Exception:
+            logger.debug("1-hop expansion failed", exc_info=True)
+
+    # Combine both sets for different search strategies
+    all_entity_names = direct_entity_names | expanded_entity_names
+
+    if not all_entity_names:
         return []
 
-    # Step 2: Find memories whose subject matches any entity name
-    conditions = []
-    params = []
-    for name in entity_names:
-        conditions.append("LOWER(m.subject) LIKE ?")
-        params.append(f"%{name.lower()}%")
+    # Step 3: Search memories_fts for content mentioning expanded entity names
+    # AND a direct entity name. This cross-referencing ensures results are
+    # relevant to the original query context (e.g., "FastAPI" AND "Doris").
+    # Without the AND, searching 170+ tech entities from Doris returns noise.
+    fts_results = []
+    seen_fts_ids = set()
 
-    where_clause = " OR ".join(conditions)
-    params.append(limit)
+    if expanded_entity_names and direct_entity_names:
+        # Sort for deterministic iteration order (sets are unordered)
+        sorted_expanded = sorted(expanded_entity_names)
 
-    rows = db.execute(f"""
-        SELECT DISTINCT m.id, m.content, m.category, m.subject, m.confidence,
-               m.created_at, m.metadata, m.importance, m.access_count,
-               1.0 as graph_score
-        FROM memories m
-        WHERE m.superseded_by IS NULL
-        AND ({where_clause})
-        ORDER BY m.importance DESC, m.created_at DESC
-        LIMIT ?
-    """, params).fetchall()
+        # Build the direct entity part of the FTS query: "Doris" OR "architecture" etc.
+        direct_terms = []
+        for name in direct_entity_names:
+            clean = re.sub(r'[^\w\s]', '', name).strip()
+            if clean:
+                direct_terms.append(f'"{clean}"')
 
-    return [dict(r) for r in rows]
+        direct_clause = " OR ".join(direct_terms) if direct_terms else None
+
+        for name in sorted_expanded:
+            clean = re.sub(r'[^\w\s]', '', name).strip()
+            if not clean or len(clean) < 2:
+                continue
+
+            # Search for memories mentioning this expanded entity
+            # (with or without direct entity context depending on availability)
+            fts_query = f'"{clean}"'
+            if direct_clause:
+                # Prefer memories mentioning both: "FastAPI" AND ("Doris")
+                fts_query_with_context = f'({direct_clause}) AND "{clean}"'
+            else:
+                fts_query_with_context = fts_query
+
+            try:
+                # Try contextual query first (e.g., "Doris" AND "FastAPI")
+                rows = db.execute("""
+                    SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                           m.created_at, m.metadata, m.importance, m.access_count,
+                           1.0 as graph_score
+                    FROM memories_fts f
+                    JOIN memories m ON f.rowid = m.rowid
+                    WHERE memories_fts MATCH ?
+                    AND m.superseded_by IS NULL
+                    LIMIT 3
+                """, (fts_query_with_context,)).fetchall()
+
+                if not rows:
+                    # Fall back to just the expanded entity name
+                    rows = db.execute("""
+                        SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                               m.created_at, m.metadata, m.importance, m.access_count,
+                               0.8 as graph_score
+                        FROM memories_fts f
+                        JOIN memories m ON f.rowid = m.rowid
+                        WHERE memories_fts MATCH ?
+                        AND m.superseded_by IS NULL
+                        LIMIT 3
+                    """, (fts_query,)).fetchall()
+
+                for row in rows:
+                    r = dict(row)
+                    if r["id"] not in seen_fts_ids:
+                        fts_results.append(r)
+                        seen_fts_ids.add(r["id"])
+            except Exception:
+                # If contextual query fails (syntax), try plain entity search
+                try:
+                    rows = db.execute("""
+                        SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                               m.created_at, m.metadata, m.importance, m.access_count,
+                               0.8 as graph_score
+                        FROM memories_fts f
+                        JOIN memories m ON f.rowid = m.rowid
+                        WHERE memories_fts MATCH ?
+                        AND m.superseded_by IS NULL
+                        LIMIT 3
+                    """, (f'"{clean}"',)).fetchall()
+                    for row in rows:
+                        r = dict(row)
+                        if r["id"] not in seen_fts_ids:
+                            fts_results.append(r)
+                            seen_fts_ids.add(r["id"])
+                except Exception:
+                    continue
+
+            if len(fts_results) >= limit:
+                break
+
+    elif direct_entity_names:
+        # No expansion — search for direct entity names only
+        for name in direct_entity_names:
+            clean = re.sub(r'[^\w\s]', '', name).strip()
+            if not clean:
+                continue
+            try:
+                rows = db.execute("""
+                    SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                           m.created_at, m.metadata, m.importance, m.access_count,
+                           1.0 as graph_score
+                    FROM memories_fts f
+                    JOIN memories m ON f.rowid = m.rowid
+                    WHERE memories_fts MATCH ?
+                    AND m.superseded_by IS NULL
+                    LIMIT 5
+                """, (f'"{clean}"',)).fetchall()
+                for row in rows:
+                    r = dict(row)
+                    if r["id"] not in seen_fts_ids:
+                        fts_results.append(r)
+                        seen_fts_ids.add(r["id"])
+            except Exception:
+                continue
+            if len(fts_results) >= limit:
+                break
+
+    fts_results = fts_results[:limit]
+
+    # Step 4: Fallback — subject LIKE matching (catches memories without FTS hits)
+    seen_ids = {r["id"] for r in fts_results}
+    remaining = limit - len(fts_results)
+
+    if remaining > 0:
+        conditions = []
+        params = []
+        for name in all_entity_names:
+            conditions.append("LOWER(m.subject) LIKE ?")
+            params.append(f"%{name.lower()}%")
+
+        if conditions:
+            where_clause = " OR ".join(conditions)
+            params.append(remaining)
+            try:
+                subject_rows = db.execute(f"""
+                    SELECT DISTINCT m.id, m.content, m.category, m.subject, m.confidence,
+                           m.created_at, m.metadata, m.importance, m.access_count,
+                           0.8 as graph_score
+                    FROM memories m
+                    WHERE m.superseded_by IS NULL
+                    AND ({where_clause})
+                    ORDER BY m.importance DESC, m.created_at DESC
+                    LIMIT ?
+                """, params).fetchall()
+
+                for row in subject_rows:
+                    row_dict = dict(row)
+                    if row_dict["id"] not in seen_ids:
+                        fts_results.append(row_dict)
+                        seen_ids.add(row_dict["id"])
+            except Exception:
+                logger.debug("Subject fallback search failed", exc_info=True)
+
+    return fts_results
 
 
 def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], k: int = 60) -> list[dict]:

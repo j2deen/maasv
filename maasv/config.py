@@ -37,6 +37,10 @@ class MaasvConfig:
     min_confidence_threshold: float = 0.5
     cluster_similarity: float = 0.85
 
+    # Cross-encoder reranking (opt-in: requires sentence-transformers + torch ~2GB)
+    cross_encoder_enabled: bool = False
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
     # Sleep worker
     idle_threshold_seconds: int = 30
     idle_check_interval: int = 5

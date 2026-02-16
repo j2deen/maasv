@@ -193,20 +193,46 @@ def _is_protected(memory: dict) -> bool:
     return False
 
 
+def _is_protected_from_dedup(memory: dict) -> bool:
+    """
+    Check if a memory is protected from deduplication (merging).
+
+    Lighter than _is_protected(): does NOT check confidence threshold.
+    All memories default to confidence=1.0, so the confidence check in
+    _is_protected() blocks ALL dedup. For merging, we only protect by
+    category and subject — we want to merge duplicate family memories
+    into better ones, not prevent all dedup.
+    """
+    import maasv
+
+    config = maasv.get_config()
+
+    category = memory.get("category", "").lower()
+    subject = (memory.get("subject") or "").lower()
+
+    # Protected categories can still be deduped (family memories often duplicate)
+    # Protected subjects can still be deduped (Adam memories often duplicate)
+    # The ONLY hard protection: identity category (e.g., "Adam is 38 years old")
+    if category == "identity":
+        return True
+
+    return False
+
+
 def _deduplicate_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> dict:
     """
     Find and merge duplicate memories using embedding similarity.
 
-    Duplicates are memories with:
-    - Same category
-    - Embedding similarity > threshold
+    Cross-category: compares ALL active memories (not just within same category).
+    Uses Union-Find to cluster transitively similar memories (A≈B and B≈C → one cluster).
 
-    When merging:
-    - Keep the memory with highest confidence
-    - Combine metadata
-    - Mark other as superseded
+    Keeper selection (in order):
+    1. Longer content (more information)
+    2. Higher importance
+    3. More recent (created_at)
 
-    Uses pre-computed embeddings from memory_vectors table for efficiency.
+    Access count transfer: keeper gets max(keeper.access_count, max(removed.access_count))
+    so frequently-accessed duplicates don't lose their retrieval boost.
     """
     import maasv
     from maasv.core.store import get_db
@@ -214,143 +240,191 @@ def _deduplicate_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     config = maasv.get_config()
     similarity_threshold = config.similarity_threshold
 
-    stats = {"found": 0, "merged": 0, "pairs": []}
+    stats = {"found": 0, "merged": 0, "clusters": []}
     db = get_db()
 
     try:
-        # Get all active memories with their categories
+        # Get all active memories (no category grouping — cross-category dedup)
         memories = db.execute("""
-            SELECT id, content, category, subject, confidence, metadata, created_at
+            SELECT id, content, category, subject, confidence, metadata,
+                   created_at, importance, access_count
             FROM memories
             WHERE superseded_by IS NULL
-            ORDER BY category, created_at DESC
+            ORDER BY created_at DESC
         """).fetchall()
 
         memories = [dict(m) for m in memories]
-        logger.info(f"[MemoryHygiene] Checking {len(memories)} memories for duplicates")
+        mem_by_id = {m["id"]: m for m in memories}
+        logger.info(f"[MemoryHygiene] Checking {len(memories)} memories for duplicates (cross-category)")
 
-        # Group by category to reduce comparison space
-        by_category = {}
-        for mem in memories:
-            cat = mem["category"]
-            if cat not in by_category:
-                by_category[cat] = []
-            by_category[cat].append(mem)
-
-        duplicates_to_merge = []
+        # --- Phase 1: Find all duplicate pairs ---
+        duplicate_pairs = []  # (id_a, id_b, similarity)
         seen_pairs = set()
 
-        for category, mems in by_category.items():
+        for mem in memories:
             if cancel_check():
                 break
-
-            if len(mems) < 2:
+            if _is_protected_from_dedup(mem):
                 continue
 
-            # For each memory, find similar ones via vector search using existing embeddings
-            for i, mem in enumerate(mems):
+            embedding_row = db.execute(
+                "SELECT embedding FROM memory_vectors WHERE id = ?",
+                (mem["id"],)
+            ).fetchone()
+
+            if not embedding_row:
+                continue
+
+            # Search across ALL categories (no category filter)
+            similar = db.execute("""
+                SELECT v.id, v.distance
+                FROM memory_vectors v
+                JOIN memories m ON v.id = m.id
+                WHERE m.superseded_by IS NULL
+                AND m.id != ?
+                AND v.embedding MATCH ?
+                AND k = 10
+                ORDER BY distance
+            """, (mem["id"], embedding_row["embedding"])).fetchall()
+
+            for row in similar:
                 if cancel_check():
                     break
-                if _is_protected(mem):
-                    continue
 
-                # Get the existing embedding for this memory
-                embedding_row = db.execute("""
-                    SELECT embedding FROM memory_vectors WHERE id = ?
-                """, (mem["id"],)).fetchone()
+                distance = row["distance"]
+                similarity = 1 - (distance ** 2 / 2)
 
-                if not embedding_row:
-                    continue  # No embedding, skip
+                if similarity > similarity_threshold:
+                    other_id = row["id"]
+                    pair_key = tuple(sorted([mem["id"], other_id]))
+                    if pair_key not in seen_pairs:
+                        seen_pairs.add(pair_key)
+                        duplicate_pairs.append((mem["id"], other_id, similarity))
 
-                # Find similar memories in same category using the existing embedding
-                similar = db.execute("""
-                    SELECT v.id, v.distance
-                    FROM memory_vectors v
-                    JOIN memories m ON v.id = m.id
-                    WHERE m.superseded_by IS NULL
-                    AND m.category = ?
-                    AND m.id != ?
-                    AND v.embedding MATCH ?
-                    AND k = 10
-                    ORDER BY distance
-                """, (category, mem["id"], embedding_row["embedding"])).fetchall()
+        logger.info(f"[MemoryHygiene] Found {len(duplicate_pairs)} duplicate pairs")
 
-                for row in similar:
-                    if cancel_check():
-                        break
+        if not duplicate_pairs:
+            return stats
 
-                    # sqlite-vec returns L2 distance, convert to similarity
-                    # For normalized embeddings, similarity ≈ 1 - (distance^2 / 2)
-                    distance = row["distance"]
-                    similarity = 1 - (distance ** 2 / 2)
+        # --- Phase 2: Union-Find to build transitive clusters ---
+        parent = {}
 
-                    if similarity > similarity_threshold:
-                        other_id = row["id"]
-                        # Avoid duplicate pairs
-                        pair_key = tuple(sorted([mem["id"], other_id]))
-                        if pair_key not in seen_pairs:
-                            seen_pairs.add(pair_key)
-                            duplicates_to_merge.append((mem["id"], other_id, similarity))
-                            stats["found"] += 1
+        def find(x):
+            while parent.get(x, x) != x:
+                parent[x] = parent.get(parent[x], parent[x])  # path compression
+                x = parent[x]
+            return x
 
-        logger.info(f"[MemoryHygiene] Found {len(duplicates_to_merge)} duplicate pairs")
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
 
-        # Merge duplicates
-        for mem1_id, mem2_id, similarity in duplicates_to_merge:
+        for id_a, id_b, _ in duplicate_pairs:
+            # Only union if neither is protected from dedup
+            mem_a = mem_by_id.get(id_a)
+            mem_b = mem_by_id.get(id_b)
+            if mem_a and mem_b and not _is_protected_from_dedup(mem_a) and not _is_protected_from_dedup(mem_b):
+                union(id_a, id_b)
+
+        # Group into clusters
+        clusters = {}
+        for id_a, id_b, _ in duplicate_pairs:
+            for mid in (id_a, id_b):
+                root = find(mid)
+                if root not in clusters:
+                    clusters[root] = set()
+                clusters[root].add(mid)
+
+        # --- Phase 3: For each cluster, pick keeper and merge ---
+        for root, member_ids in clusters.items():
             if cancel_check():
                 break
 
-            # Get both memories
-            mem1 = db.execute("SELECT * FROM memories WHERE id = ?", (mem1_id,)).fetchone()
-            mem2 = db.execute("SELECT * FROM memories WHERE id = ?", (mem2_id,)).fetchone()
-
-            if not mem1 or not mem2:
+            members = [mem_by_id[mid] for mid in member_ids if mid in mem_by_id]
+            if len(members) < 2:
                 continue
 
-            mem1 = dict(mem1)
-            mem2 = dict(mem2)
-
-            # Skip if either is protected
-            if _is_protected(mem1) or _is_protected(mem2):
+            # Skip clusters where all members are protected
+            non_protected = [m for m in members if not _is_protected_from_dedup(m)]
+            if len(non_protected) < 2:
                 continue
 
-            # Keep the one with higher confidence (or newer if equal)
-            if mem1.get("confidence", 1.0) >= mem2.get("confidence", 1.0):
-                keep, remove = mem1, mem2
-            else:
-                keep, remove = mem2, mem1
+            # Keeper selection: longest content → highest importance → most recent
+            members.sort(key=lambda m: (
+                len(m.get("content") or ""),
+                m.get("importance") or 0.5,
+                m.get("created_at") or "",
+            ), reverse=True)
 
-            stats["pairs"].append({
-                "keep": keep["id"],
-                "remove": remove["id"],
-                "similarity": similarity,
-                "keep_content": keep["content"][:100],
-                "remove_content": remove["content"][:100]
-            })
+            keeper = members[0]
+            to_remove = [m for m in members[1:] if not _is_protected_from_dedup(m)]
+
+            if not to_remove:
+                continue
+
+            # Access count transfer: keeper gets the max across the whole cluster
+            max_access = max(m.get("access_count") or 0 for m in members)
+
+            stats["found"] += len(to_remove)
+            cluster_info = {
+                "keeper_id": keeper["id"],
+                "keeper_content": keeper["content"][:120],
+                "keeper_access_count": keeper.get("access_count") or 0,
+                "inherited_access_count": max_access,
+                "removed": [
+                    {
+                        "id": m["id"],
+                        "content": m["content"][:120],
+                        "category": m["category"],
+                        "access_count": m.get("access_count") or 0,
+                    }
+                    for m in to_remove
+                ],
+            }
+            stats["clusters"].append(cluster_info)
 
             if not dry_run:
-                # Mark the duplicate as superseded
-                db.execute("""
-                    UPDATE memories
-                    SET superseded_by = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (keep["id"], remove["id"]))
-
-                # Merge metadata if present
-                keep_meta = json.loads(keep["metadata"]) if keep.get("metadata") else {}
-                remove_meta = json.loads(remove["metadata"]) if remove.get("metadata") else {}
-                if remove_meta:
-                    merged_meta = {**remove_meta, **keep_meta}  # keep wins on conflicts
+                for removed in to_remove:
+                    # Mark as superseded
                     db.execute("""
                         UPDATE memories
-                        SET metadata = ?, updated_at = CURRENT_TIMESTAMP
+                        SET superseded_by = ?, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    """, (json.dumps(merged_meta), keep["id"]))
+                    """, (keeper["id"], removed["id"]))
 
-                stats["merged"] += 1
+                    # Merge metadata (guard against non-dict JSON values)
+                    keep_meta = json.loads(keeper["metadata"]) if keeper.get("metadata") else {}
+                    if not isinstance(keep_meta, dict):
+                        keep_meta = {}
+                    remove_meta = json.loads(removed["metadata"]) if removed.get("metadata") else {}
+                    if not isinstance(remove_meta, dict):
+                        remove_meta = {}
+                    if remove_meta:
+                        merged_meta = {**remove_meta, **keep_meta}
+                        db.execute("""
+                            UPDATE memories
+                            SET metadata = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (json.dumps(merged_meta), keeper["id"]))
+
+                    stats["merged"] += 1
+
+                # Transfer access count to keeper
+                if max_access > (keeper.get("access_count") or 0):
+                    db.execute("""
+                        UPDATE memories
+                        SET access_count = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (max_access, keeper["id"]))
 
         if not dry_run:
             db.commit()
+
+        logger.info(
+            f"[MemoryHygiene] Dedup complete: {len(stats['clusters'])} clusters, "
+            f"{stats['merged']} merged"
+        )
 
     finally:
         db.close()

@@ -4,7 +4,7 @@ Entity Extraction for Knowledge Graph Population
 Extracts entities and relationships from conversation summaries using LLM.
 Uses the injected LLMProvider — no direct API calls.
 
-Entity Types: person, place, project, organization, event
+Entity Types: person, place, project, organization, event, technology
 """
 
 import json
@@ -32,6 +32,8 @@ PREDICATE_OBJECT_TYPE = {
     "located_in": "place", "lives_in": "place", "visited": "place", "located_at": "place",
     "works_on": "project", "manages": "project", "created": "project", "owns": "project",
     "works_at": "organization",
+    "uses_tech": "technology", "built_with": "technology", "runs_on": "technology",
+    "hosted_on": "technology", "depends_on": "technology", "written_in": "technology",
     "parent_of": "person", "child_of": "person", "married_to": "person",
     "sibling_of": "person", "friend_of": "person", "works_with": "person", "colleague_of": "person",
     # Causal predicates — any entity type
@@ -86,6 +88,7 @@ Extract:
 3. **Projects** - Work or personal projects mentioned
 4. **Organizations** - Companies, schools, teams
 5. **Events** - Specific events or occasions
+6. **Technologies** - Programming languages, frameworks, databases, tools, services, platforms
 
 For each entity, also identify relationships to other entities.
 
@@ -97,7 +100,7 @@ Return JSON:
     "entities": [
         {
             "name": "Display Name",
-            "type": "person|place|project|organization|event",
+            "type": "person|place|project|organization|event|technology",
             "description": "Brief context",
             "confidence": 0.0-1.0
         }
@@ -119,6 +122,8 @@ Relationship predicates:
 - friend_of, works_with, colleague_of (social)
 - works_at, works_on, manages (professional)
 - located_in, visited, lives_in (location)
+- uses_tech, built_with, written_in (technology — project uses a technology)
+- runs_on, hosted_on, depends_on (infrastructure — project runs on a platform/service)
 - has_email, has_phone, has_birthday (attributes - object_is_entity: false)
 - caused_by, led_to, resulted_in (causal — only when clearly stated, confidence 0.9+)
 - motivated_by, enabled_by, blocked_by (causal reasoning)
