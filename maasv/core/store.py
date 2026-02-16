@@ -421,58 +421,90 @@ def find_similar_memories(
     subject: Optional[str] = None
 ) -> list[dict]:
     """
-    Find memories similar to query using vector search with importance-weighted reranking.
+    Find memories using 3-signal retrieval with importance-weighted reranking.
 
-    Over-retrieves by 3x, then reranks using:
-        score = (1 - distance) * importance * decay_factor * log(2 + access_count)
+    Pipeline:
+    1. Dense vector similarity → top N candidates (primary signal)
+    2. BM25 keyword matching (FTS5) → top N candidates
+    3. Graph connectivity (entity mentions → subject match) → top N candidates
+    4. RRF fusion → unified candidate pool (deduped)
+    5. Filter by category/subject (if specified)
+    6. Split: primary (vector-retrieved) scored with Phase 1 importance formula,
+       supplementary (BM25/graph-only) scored separately
+    7. Primary results first, supplementary fills remaining slots
+    8. Record access
 
-    Protected categories (family, identity) are exempt from time decay.
-    Optionally filters by category and/or subject.
+    Multi-signal agreement: primary results found by multiple signals get a
+    small additive bonus. Protected categories (family, identity) exempt from decay.
     """
     import math
+    import re
 
-    query_embedding = get_query_embedding(query)
-
-    # Over-retrieve 3x candidates for reranking
-    fetch_limit = limit * 3
-
-    sql = """
-        SELECT
-            v.id,
-            m.content,
-            m.category,
-            m.subject,
-            m.confidence,
-            m.created_at,
-            m.metadata,
-            m.importance,
-            m.access_count,
-            distance
-        FROM memory_vectors v
-        JOIN memories m ON v.id = m.id
-        WHERE m.superseded_by IS NULL
-        AND v.embedding MATCH ?
-        AND k = ?
-        ORDER BY distance
-    """
+    # Per-signal retrieval depth. Higher than Phase 1's 3x because multi-signal
+    # fusion benefits from broader candidate pools — BM25 and graph may surface
+    # relevant results at deeper ranks. Cap keeps total candidates manageable
+    # (~50-75 unique after RRF dedup).
+    RETRIEVAL_DEPTH = max(limit * 5, 25)
 
     import maasv
     protected = maasv.get_config().protected_categories
     now = datetime.now(timezone.utc)
 
     with _db() as db:
-        rows = db.execute(sql, (serialize_embedding(query_embedding), fetch_limit)).fetchall()
-        candidates = [dict(row) for row in rows]
+        # === Signal 1: Dense vector similarity ===
+        query_embedding = get_query_embedding(query)
+        vector_rows = db.execute("""
+            SELECT
+                v.id, m.content, m.category, m.subject, m.confidence,
+                m.created_at, m.metadata, m.importance, m.access_count,
+                distance
+            FROM memory_vectors v
+            JOIN memories m ON v.id = m.id
+            WHERE m.superseded_by IS NULL
+            AND v.embedding MATCH ?
+            AND k = ?
+            ORDER BY distance
+        """, (serialize_embedding(query_embedding), RETRIEVAL_DEPTH)).fetchall()
+        vector_results = [dict(row) for row in vector_rows]
 
-        # Filter by category/subject if specified
+        # === Signal 2: BM25 keyword matching ===
+        bm25_results = _find_memories_by_bm25(db, query, limit=RETRIEVAL_DEPTH)
+
+        # === Signal 3: Graph connectivity ===
+        graph_results = _find_memories_by_graph(db, query, limit=RETRIEVAL_DEPTH)
+
+        # === Fusion: Reciprocal Rank Fusion ===
+        signals = [vector_results, bm25_results, graph_results]
+        # Only include non-empty signals
+        active_signals = [s for s in signals if s]
+
+        if not active_signals:
+            return []
+
+        if len(active_signals) == 1:
+            # Single signal — skip RRF overhead
+            candidates = active_signals[0]
+        else:
+            candidates = _reciprocal_rank_fusion(active_signals, k=60)
+
+        # === Filter by category/subject ===
         if category:
             candidates = [c for c in candidates if c['category'] == category]
         if subject:
             candidates = [c for c in candidates if c.get('subject') and subject.lower() in c['subject'].lower()]
 
-        # Rerank by importance-weighted score
+        # === Importance-weighted reranking ===
+        # Strategy: vector distance is primary quality signal (Phase 1 formula).
+        # BM25/graph agreement provides a multiplicative boost.
+        # Non-vector results are scored separately and appended as diversity fills.
+        vector_distances = {r['id']: r['distance'] for r in vector_results}
+        bm25_ids = {r['id'] for r in bm25_results}
+        graph_ids = {r['id'] for r in graph_results}
+
+        primary = []    # Vector-retrieved candidates (scored with distance)
+        supplementary = []  # BM25/graph-only candidates (scored by importance)
+
         for mem in candidates:
-            distance = mem.get('distance', 1.0)
             importance = mem.get('importance') or 0.5
             access_count = mem.get('access_count') or 0
 
@@ -489,14 +521,84 @@ def find_similar_memories(
                     days_old = 0
                 decay_factor = math.exp(-days_old / 180)
 
-            mem['_score'] = (1 - distance) * importance * decay_factor * math.log(2 + access_count)
+            # Dampen access_count to prevent feedback loops: frequently-retrieved
+            # memories would otherwise snowball (acc=7 → 3.17x boost over acc=0).
+            # Cap at 5 accesses (max 2.81x boost) so new/rare memories can compete.
+            dampened_access = min(access_count, 5)
 
-        candidates.sort(key=lambda m: m['_score'], reverse=True)
-        result = candidates[:limit]
+            distance = vector_distances.get(mem['id'])
+            if distance is not None:
+                # Primary: scored with Phase 1 formula.
+                # (1 - distance) can be negative for cosine dist > 1.0 — that's fine,
+                # negative scores still rank correctly relative to other vector results.
+                base_score = (1.0 - distance) * importance * decay_factor * math.log(2 + dampened_access)
 
-        # Clean up internal scoring field
+                # Multi-signal agreement boost: memories found by multiple signals
+                # get an additive bonus (not multiplicative — multiplying negative
+                # scores would invert the ranking).
+                signal_count = 1  # already in vector
+                if mem['id'] in bm25_ids:
+                    signal_count += 1
+                if mem['id'] in graph_ids:
+                    signal_count += 1
+                agreement_bonus = (signal_count - 1) * 0.01
+
+                mem['_score'] = base_score + agreement_bonus
+                primary.append(mem)
+            else:
+                # Supplementary: found only by BM25/graph, no vector match.
+                # These fill remaining slots after all vector results.
+                mem['_score'] = importance * decay_factor * math.log(2 + dampened_access) * 0.0001
+                supplementary.append(mem)
+
+        # Sort each group independently
+        primary.sort(key=lambda m: m['_score'], reverse=True)
+        supplementary.sort(key=lambda m: m['_score'], reverse=True)
+
+        # === Diversity-aware selection (MMR-inspired) ===
+        # Greedily select from primary, skipping candidates too similar to
+        # already-selected results. This prevents near-duplicate memories
+        # (e.g., 5 copies of "Adam has a Mac Mini") from filling all slots.
+        # Similarity is measured by word overlap (Jaccard). Threshold adapts:
+        # short memories (< 12 words) use 0.5 (they're easily near-duplicates),
+        # longer memories use 0.7 (more content means legitimate diversity).
+        result = []
+        selected_words = []  # list of word-sets for selected results
+
+        for pool in [primary, supplementary]:
+            if len(result) >= limit:
+                break
+            for mem in pool:
+                if len(result) >= limit:
+                    break
+                # Check diversity: is this too similar to any selected result?
+                mem_words = set(re.findall(r'\w+', mem.get('content', '').lower()))
+                threshold = 0.5 if len(mem_words) < 12 else 0.7
+                is_diverse = True
+                for sw in selected_words:
+                    if not mem_words or not sw:
+                        continue
+                    intersection = len(mem_words & sw)
+                    union = len(mem_words | sw)
+                    jaccard = intersection / union if union > 0 else 0
+                    # Also check asymmetric containment: if one memory's words
+                    # are mostly a subset of another, it's redundant
+                    smaller = min(len(mem_words), len(sw))
+                    containment = intersection / smaller if smaller > 0 else 0
+                    if jaccard > threshold or containment > 0.8:
+                        is_diverse = False
+                        break
+                if is_diverse:
+                    result.append(mem)
+                    selected_words.append(mem_words)
+
+        # Clean up internal scoring fields
         for mem in result:
-            del mem['_score']
+            mem.pop('_score', None)
+            mem.pop('rrf_score', None)
+            mem.pop('bm25_score', None)
+            mem.pop('graph_score', None)
+            mem.pop('distance', None)
 
         _record_memory_access(db, [r['id'] for r in result])
 
@@ -550,6 +652,130 @@ def search_fts(query: str, limit: int = 10, category: Optional[str] = None) -> l
             """, (query, limit)).fetchall()
 
     return [dict(row) for row in rows]
+
+
+# ============================================================================
+# MULTI-SIGNAL RETRIEVAL (Phase 2)
+# ============================================================================
+
+def _find_memories_by_bm25(db: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
+    """
+    Return memories ranked by BM25 relevance from the FTS5 index.
+
+    Uses bm25() scoring function with weights: content=10, category=1, subject=5.
+    Only returns active (non-superseded) memories.
+    Returns dicts with 'id' key (required for RRF) and 'bm25_score'.
+    """
+    try:
+        rows = db.execute("""
+            SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                   m.created_at, m.metadata, m.importance, m.access_count,
+                   bm25(memories_fts, 10.0, 1.0, 5.0) as bm25_score
+            FROM memories_fts f
+            JOIN memories m ON f.rowid = m.rowid
+            WHERE memories_fts MATCH ?
+            AND m.superseded_by IS NULL
+            ORDER BY bm25(memories_fts, 10.0, 1.0, 5.0)
+            LIMIT ?
+        """, (query, limit)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.debug("BM25 search failed for query: %s", query, exc_info=True)
+        return []
+
+
+def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50) -> list[dict]:
+    """
+    Find memories connected to entities mentioned in the query.
+
+    Flow:
+    1. Match query terms against entity names via entities_fts
+    2. Find memories whose subject matches any discovered entity's canonical_name or name
+    3. Also search memory content for direct entity name mentions
+
+    Note: No hop expansion yet — direct entity matches only. Hop expansion
+    added too much noise (TerryAnn → Adam → family memories). Will add
+    weighted hop expansion in a future iteration when graph is denser.
+
+    Returns dicts with 'id' key (required for RRF) and 'graph_score'.
+    """
+    # Step 1: Find entities mentioned in the query via FTS
+    try:
+        entities = db.execute("""
+            SELECT e.id, e.canonical_name, e.name
+            FROM entities_fts f
+            JOIN entities e ON f.rowid = e.rowid
+            WHERE entities_fts MATCH ?
+            LIMIT 10
+        """, (query,)).fetchall()
+    except Exception:
+        logger.debug("Entity FTS failed for query: %s", query, exc_info=True)
+        return []
+
+    if not entities:
+        return []
+
+    entity_names = set()
+    for e in entities:
+        if e["canonical_name"]:
+            entity_names.add(e["canonical_name"])
+        if e["name"]:
+            entity_names.add(e["name"].lower())
+
+    if not entity_names:
+        return []
+
+    # Step 2: Find memories whose subject matches any entity name
+    conditions = []
+    params = []
+    for name in entity_names:
+        conditions.append("LOWER(m.subject) LIKE ?")
+        params.append(f"%{name.lower()}%")
+
+    where_clause = " OR ".join(conditions)
+    params.append(limit)
+
+    rows = db.execute(f"""
+        SELECT DISTINCT m.id, m.content, m.category, m.subject, m.confidence,
+               m.created_at, m.metadata, m.importance, m.access_count,
+               1.0 as graph_score
+        FROM memories m
+        WHERE m.superseded_by IS NULL
+        AND ({where_clause})
+        ORDER BY m.importance DESC, m.created_at DESC
+        LIMIT ?
+    """, params).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], k: int = 60) -> list[dict]:
+    """
+    Merge multiple ranked lists using Reciprocal Rank Fusion.
+
+    Each list is a sequence of dicts with at least an 'id' key.
+    RRF score for each item = sum over lists of 1/(k + rank + 1).
+    Returns fused list sorted by combined RRF score descending.
+    """
+    scores: dict[str, float] = {}
+    items: dict[str, dict] = {}
+
+    for ranked_list in ranked_lists:
+        for rank, item in enumerate(ranked_list):
+            item_id = item["id"]
+            rrf_score = 1.0 / (k + rank + 1)
+            scores[item_id] = scores.get(item_id, 0.0) + rrf_score
+            if item_id not in items:
+                items[item_id] = item
+
+    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    result = []
+    for item_id, score in fused:
+        entry = items[item_id].copy()
+        entry["rrf_score"] = score
+        result.append(entry)
+
+    return result
 
 
 def check_conflicts(content: str, subject: Optional[str] = None) -> list[dict]:
