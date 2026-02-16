@@ -1560,6 +1560,112 @@ def find_or_create_entity(
     return create_entity(name, entity_type, metadata=metadata)
 
 
+def merge_entity(keeper_id: str, duplicate_ids: list[str]) -> dict:
+    """
+    Merge duplicate entities into a single keeper entity.
+
+    Reassigns all relationships from duplicates to keeper, transfers access_count,
+    merges metadata, and deletes the duplicates. FTS triggers handle cleanup.
+
+    Args:
+        keeper_id: Entity ID to keep
+        duplicate_ids: List of entity IDs to merge into keeper
+
+    Returns:
+        Stats dict: {relationships_updated, entities_deleted, rel_dupes_removed}
+    """
+    if not duplicate_ids:
+        return {"relationships_updated": 0, "entities_deleted": 0, "rel_dupes_removed": 0}
+
+    stats = {"relationships_updated": 0, "entities_deleted": 0, "rel_dupes_removed": 0}
+
+    with _db() as db:
+        # Verify keeper exists
+        keeper = db.execute("SELECT * FROM entities WHERE id = ?", (keeper_id,)).fetchone()
+        if not keeper:
+            raise ValueError(f"Keeper entity {keeper_id} not found")
+        keeper = dict(keeper)
+
+        # Verify all duplicates exist
+        all_dup_ids = []
+        for dup_id in duplicate_ids:
+            dup = db.execute("SELECT * FROM entities WHERE id = ?", (dup_id,)).fetchone()
+            if dup:
+                all_dup_ids.append(dup_id)
+            else:
+                logger.warning(f"Duplicate entity {dup_id} not found, skipping")
+
+        if not all_dup_ids:
+            return stats
+
+        placeholders = ",".join("?" * len(all_dup_ids))
+
+        # 1. Reassign subject_id relationships
+        result = db.execute(
+            f"UPDATE relationships SET subject_id = ? WHERE subject_id IN ({placeholders})",
+            [keeper_id] + all_dup_ids
+        )
+        stats["relationships_updated"] += result.rowcount
+
+        # 2. Reassign object_id relationships
+        result = db.execute(
+            f"UPDATE relationships SET object_id = ? WHERE object_id IN ({placeholders})",
+            [keeper_id] + all_dup_ids
+        )
+        stats["relationships_updated"] += result.rowcount
+
+        # 3. Transfer access_count — keeper gets max across all
+        all_ids = [keeper_id] + all_dup_ids
+        all_placeholders = ",".join("?" * len(all_ids))
+        max_access_row = db.execute(
+            f"SELECT MAX(COALESCE(access_count, 0)) as max_ac FROM entities WHERE id IN ({all_placeholders})",
+            all_ids
+        ).fetchone()
+        max_access = max_access_row["max_ac"] or 0
+
+        if max_access > (keeper.get("access_count") or 0):
+            db.execute(
+                "UPDATE entities SET access_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (max_access, keeper_id)
+            )
+
+        # 4. Merge metadata — keeper wins conflicts, preserve unique keys from duplicates
+        keeper_meta = json.loads(keeper["metadata"]) if keeper.get("metadata") else {}
+        if not isinstance(keeper_meta, dict):
+            keeper_meta = {}
+
+        for dup_id in all_dup_ids:
+            dup = db.execute("SELECT metadata FROM entities WHERE id = ?", (dup_id,)).fetchone()
+            if dup and dup["metadata"]:
+                dup_meta = json.loads(dup["metadata"])
+                if isinstance(dup_meta, dict):
+                    # Duplicate keys fill in gaps, keeper wins conflicts
+                    merged = {**dup_meta, **keeper_meta}
+                    keeper_meta = merged
+
+        if keeper_meta:
+            db.execute(
+                "UPDATE entities SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(keeper_meta), keeper_id)
+            )
+
+        # 5. Delete duplicate entities (FTS trigger cleans up automatically)
+        db.execute(
+            f"DELETE FROM entities WHERE id IN ({placeholders})",
+            all_dup_ids
+        )
+        stats["entities_deleted"] = len(all_dup_ids)
+
+        db.commit()
+
+    # 6. Relationship dedup — merging may have created duplicate triples
+    from maasv.lifecycle.memory_hygiene import _deduplicate_relationships
+    rel_stats = _deduplicate_relationships(dry_run=False)
+    stats["rel_dupes_removed"] = rel_stats["removed"]
+
+    return stats
+
+
 def search_entities(
     query: str,
     entity_type: Optional[str] = None,
