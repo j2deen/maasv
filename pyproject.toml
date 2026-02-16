@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maasv"
+version = "0.1.0"
+description = "Cognition layer for AI agents — memory lifecycle engine"
+requires-python = ">=3.11"
+license = {text = "BSL-1.1"}
+dependencies = [
+    "sqlite-vec>=0.1.1",
+]
+
+[project.optional-dependencies]
+ollama = ["ollama>=0.4.0"]
+sentence-transformers = ["sentence-transformers>=2.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["maasv*"]
