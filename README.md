@@ -4,21 +4,21 @@
 
 Your AI remembers things now. It knows your name, your preferences, bits and pieces from past conversations. That's table stakes. But it doesn't *think* about what it knows. It doesn't connect dots across sources, notice patterns over time, or learn from what worked and what didn't. It remembers what you said. maasv understands what you meant.
 
-maasv is the layer that closes that gap -- cognition for AI agents. Not just storage and retrieval. A full lifecycle that extracts, structures, connects, consolidates, and prunes knowledge over time.
+maasv is the layer that closes that gap. Cognition for AI agents. Not just storage and retrieval. A full lifecycle that extracts, structures, connects, consolidates, and prunes knowledge over time.
 
 ## What changes
 
 Without maasv, your agent answers questions. With it, your agent *notices things*.
 
-It remembers that the person you're meeting tomorrow was mentioned in a conversation three weeks ago -- and surfaces the context before you ask. It connects a complaint from a customer in March to a feature request from their team in June. It knows you tried a particular approach before and it didn't work, so it suggests something different this time.
+It remembers that the person you're meeting tomorrow was mentioned in a conversation three weeks ago, and surfaces the context before you ask. It connects a complaint from a customer in March to a feature request from their team in June. It knows you tried a particular approach before and it didn't work, so it suggests something different this time.
 
-This isn't retrieval-augmented generation. RAG finds documents. maasv builds understanding -- a living knowledge graph that grows, consolidates, and prunes itself over time. Data comes in from disparate sources, gets structured into entities and relationships, and what comes back out isn't just information. It's insight.
+This isn't retrieval-augmented generation. RAG finds documents. maasv builds understanding. A living knowledge graph that grows, consolidates, and prunes itself over time. Data comes in from disparate sources, gets structured into entities and relationships, and what comes back out isn't just information. It's insight.
 
 Your agent doesn't just have access to what it's been told. It has *perspective*.
 
 ## Where this came from
 
-I built [Doris](https://github.com/ascottbell/doris), a personal AI assistant for me and my family. She helps with schedules, remembers preferences, keeps track of projects, knows the kids' birthdays without being told twice. The kind of stuff that sounds simple until you realize every AI assistant forgets everything the moment the conversation ends.
+I built [Doris](https://github.com/ascottbell/doris), a personal AI assistant for me and my family. She helps with schedules, remembers preferences, keeps track of projects, flags emails, sets reminders, sends directions, knows the kids' birthdays, and she sends me relevant messages at the right times, all proactively.
 
 The memory system ended up being the most interesting part. Not the LLM, not the tool calling, not the integrations. The memory. Because memory is what makes an agent feel like it actually knows you.
 
@@ -28,17 +28,17 @@ So I pulled it out into its own package. maasv is the engine that powers Doris's
 
 Most memory tools store and retrieve. That's two steps. maasv owns six:
 
-**Extract** -- Entities, relationships, and facts are pulled from conversations by your LLM. People, places, projects, technologies, and how they connect to each other. Not keywords. Structure.
+**Extract.** Entities, relationships, and facts are pulled from conversations by your LLM. People, places, projects, technologies, and how they connect to each other. Not keywords. Structure.
 
-**Store** -- Memories are embedded, categorized, and deduplicated on the way in. Each one carries metadata: confidence, importance, subject, access history. Not a vector dump.
+**Store.** Memories are embedded, categorized, and deduplicated on the way in. Each one carries metadata: confidence, importance, subject, access history. Not a vector dump.
 
-**Consolidate** -- During idle time, maasv merges near-duplicates, clusters related memories, resolves vague references to specific entities, and pre-computes common graph paths. Your agent's understanding gets sharper while nobody's using it.
+**Consolidate.** During idle time, maasv merges near-duplicates, clusters related memories, resolves vague references to specific entities, and pre-computes common graph paths. Your agent's understanding gets sharper while nobody's using it.
 
-**Retrieve** -- Three signals fused together: dense vector search (semantic similarity), BM25 keyword matching (exact terms via FTS5), and graph connectivity (1-hop entity expansion). Merged with Reciprocal Rank Fusion, optionally reranked by a cross-encoder. This is how your agent finds the thing it didn't know it was looking for.
+**Retrieve.** Three signals fused together: dense vector search (semantic similarity), BM25 keyword matching (exact terms via FTS5), and graph connectivity (1-hop entity expansion). Merged with Reciprocal Rank Fusion, optionally reranked by a cross-encoder. This is how your agent finds the thing it didn't know it was looking for.
 
-**Decay** -- Memories that stop being accessed lose confidence over time. Protected categories (identity, family, core preferences) are exempt. Everything else has to earn its place.
+**Decay.** Memories that stop being accessed lose confidence over time. Protected categories (identity, family, core preferences) are exempt. Everything else has to earn its place.
 
-**Forget** -- Stale, low-confidence memories are pruned. Orphaned entities are cleaned up. The knowledge graph stays lean. This is the part most memory systems skip, and it's why most memory systems get worse over time instead of better.
+**Forget.** Stale, low-confidence memories are pruned. Orphaned entities are cleaned up. The knowledge graph stays lean. This is the part most memory systems skip, and it's why most memory systems get worse over time instead of better.
 
 ## Install
 
@@ -167,12 +167,12 @@ config = MaasvConfig(
 
 ## Status
 
-This is running in production powering [Doris](https://github.com/ascottbell/doris), but the public API may shift as more people use it. The core concepts -- memory, graph, retrieval, wisdom, lifecycle -- are stable. The edges are still being refined.
+This is running in production powering [Doris](https://github.com/ascottbell/doris), but the public API may shift as more people use it. The core concepts (memory, graph, retrieval, wisdom, lifecycle) are stable. The edges are still being refined.
 
 ## License
 
-Business Source License 1.1. Free for personal, internal, educational, and non-commercial use. Commercial use requires a license -- contact admin@maasv.ai. Converts to Apache 2.0 on 2030-02-16. See [LICENSE](LICENSE) for details.
+Business Source License 1.1. Free for personal, internal, educational, and non-commercial use. Commercial use requires a license. Contact admin@maasv.ai. Converts to Apache 2.0 on 2030-02-16. See [LICENSE](LICENSE) for details.
 
 ## Related
 
-- **[Doris](https://github.com/ascottbell/doris)** -- The AI assistant maasv was built for. If maasv is the cognition layer, Doris is the person using it.
+- **[Doris](https://github.com/ascottbell/doris)** The AI assistant maasv was built for. If maasv is the cognition layer, Doris is the person using it.
