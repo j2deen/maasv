@@ -7,7 +7,6 @@ Uses the injected LLMProvider — no direct API calls.
 Entity Types: person, place, project, organization, event, technology
 """
 
-import json
 import logging
 from typing import Optional
 
@@ -137,9 +136,9 @@ IMPORTANT:
 - Return empty arrays if nothing notable to extract
 
 CONVERSATION SUMMARY:
-{summary}
+__SUMMARY__
 
-TOPIC: {topic}
+TOPIC: __TOPIC__
 """
 
 
@@ -165,9 +164,10 @@ class EntityExtractor:
         llm = maasv.get_llm()
 
         prompt_template = _build_extraction_prompt(config.known_entities)
-        prompt = prompt_template.format(
-            summary=summary,
-            topic=topic or "General conversation"
+        prompt = prompt_template.replace(
+            "__SUMMARY__", summary
+        ).replace(
+            "__TOPIC__", topic or "General conversation"
         )
 
         try:
@@ -193,9 +193,6 @@ class EntityExtractor:
 
             return {"entities": entities, "relationships": relationships, "status": "success"}
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse extraction response: {e}")
-            return {"entities": [], "relationships": [], "status": "error", "error": str(e)}
         except Exception as e:
             logger.error(f"Extraction failed: {e}")
             return {"entities": [], "relationships": [], "status": "error", "error": str(e)}

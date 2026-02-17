@@ -468,8 +468,8 @@ def _find_memories_by_graph(db, query: str, limit: int = 50) -> list[dict]:
         conditions = []
         params = []
         for name in all_entity_names:
-            conditions.append("LOWER(m.subject) LIKE ?")
-            params.append(f"%{name.lower()}%")
+            conditions.append("LOWER(m.subject) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(name.lower())}%")
 
         if conditions:
             where_clause = " OR ".join(conditions)

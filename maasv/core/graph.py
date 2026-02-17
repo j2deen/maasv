@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from maasv.core.db import _db, _record_entity_access
+from maasv.core.db import _db, _record_entity_access, _escape_like
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,11 @@ def merge_entity(keeper_id: str, duplicate_ids: list[str]) -> dict:
     if not duplicate_ids:
         return {"relationships_updated": 0, "entities_deleted": 0, "rel_dupes_removed": 0}
 
+    # Guard against keeper being in the duplicate list (would delete the keeper)
+    duplicate_ids = [d for d in duplicate_ids if d != keeper_id]
+    if not duplicate_ids:
+        return {"relationships_updated": 0, "entities_deleted": 0, "rel_dupes_removed": 0}
+
     stats = {"relationships_updated": 0, "entities_deleted": 0, "rel_dupes_removed": 0}
 
     with _db() as db:
@@ -286,16 +291,17 @@ def search_entities(
                     LIMIT ?
                 """, (query, limit)).fetchall()
         except Exception:
+            escaped_query = _escape_like(query)
             if entity_type:
                 rows = db.execute("""
                     SELECT * FROM entities
-                    WHERE name LIKE ? AND entity_type = ?
+                    WHERE name LIKE ? ESCAPE '\\' AND entity_type = ?
                     LIMIT ?
-                """, (f"%{query}%", entity_type, limit)).fetchall()
+                """, (f"%{escaped_query}%", entity_type, limit)).fetchall()
             else:
                 rows = db.execute("""
-                    SELECT * FROM entities WHERE name LIKE ? LIMIT ?
-                """, (f"%{query}%", limit)).fetchall()
+                    SELECT * FROM entities WHERE name LIKE ? ESCAPE '\\' LIMIT ?
+                """, (f"%{escaped_query}%", limit)).fetchall()
 
     results = []
     for row in rows:

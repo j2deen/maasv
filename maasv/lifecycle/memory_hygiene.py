@@ -226,22 +226,10 @@ def _is_protected_from_dedup(memory: dict) -> bool:
     """
     Check if a memory is protected from deduplication (merging).
 
-    Lighter than _is_protected(): does NOT check confidence threshold.
-    All memories default to confidence=1.0, so the confidence check in
-    _is_protected() blocks ALL dedup. For merging, we only protect by
-    category and subject — we want to merge duplicate family memories
-    into better ones, not prevent all dedup.
+    Only identity memories are protected — we want to merge duplicates
+    in other categories (family, preference, etc.) into better versions.
     """
-    import maasv
-
-    config = maasv.get_config()
-
     category = memory.get("category", "").lower()
-    subject = (memory.get("subject") or "").lower()
-
-    # Protected categories can still be deduped (family memories often duplicate)
-    # Protected subjects can still be deduped (user memories often duplicate)
-    # The ONLY hard protection: identity category (e.g., "User is 38 years old")
     if category == "identity":
         return True
 
@@ -480,7 +468,7 @@ def _prune_stale_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     db = get_db()
 
     try:
-        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=config.stale_days)).isoformat()
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=config.stale_days)).strftime("%Y-%m-%d %H:%M:%S")
 
         # Find stale, low-confidence memories
         candidates = db.execute("""

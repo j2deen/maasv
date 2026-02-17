@@ -7,8 +7,6 @@ and access tracking. All other core modules import from here for DB access.
 
 import logging
 import sqlite3
-import json
-import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional, Callable
@@ -294,14 +292,19 @@ def init_db():
     # Previously added lazily by reorganize.py, but _record_entity_access
     # and merge_entity depend on them.
     def _migrate_entity_access(db: sqlite3.Connection):
-        try:
-            db.execute("ALTER TABLE entities ADD COLUMN access_count INTEGER DEFAULT 0")
-        except Exception:
-            pass  # Column already exists (added by reorganize.py)
-        try:
-            db.execute("ALTER TABLE entities ADD COLUMN last_accessed_at TEXT DEFAULT NULL")
-        except Exception:
-            pass  # Column already exists
+        # These columns may already exist (previously added lazily by reorganize.py).
+        # Only suppress the specific "duplicate column" error.
+        for col_def in [
+            "ALTER TABLE entities ADD COLUMN access_count INTEGER DEFAULT 0",
+            "ALTER TABLE entities ADD COLUMN last_accessed_at TEXT DEFAULT NULL",
+        ]:
+            try:
+                db.execute(col_def)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" in str(e).lower():
+                    pass  # Already exists, expected
+                else:
+                    raise
 
     run_migration(db, 3, "Entity access tracking columns", _migrate_entity_access)
 
@@ -338,7 +341,7 @@ def _record_memory_access(db: sqlite3.Connection, memory_ids: list[str]):
     """Increment access_count and set last_accessed_at for retrieved memories."""
     if not memory_ids:
         return
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     placeholders = ",".join("?" * len(memory_ids))
     try:
         db.execute(
@@ -355,7 +358,7 @@ def _record_entity_access(db: sqlite3.Connection, entity_ids: list[str]):
     """Increment access_count and set last_accessed_at for retrieved entities."""
     if not entity_ids:
         return
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     placeholders = ",".join("?" * len(entity_ids))
     try:
         db.execute(

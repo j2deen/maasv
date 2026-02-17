@@ -146,7 +146,7 @@ def get_recent_memories(
     limit: int = 50
 ) -> list[dict]:
     """Get recent memories from the last N hours."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
     query = "SELECT * FROM memories WHERE superseded_by IS NULL AND created_at >= ?"
     params: list = [cutoff]
