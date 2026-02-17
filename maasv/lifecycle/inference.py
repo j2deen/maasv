@@ -124,11 +124,16 @@ JSON output:"""
 
 
 def _store_inferences(inferences: list[dict]) -> int:
-    """Store inferences in the graph as low-confidence relationships."""
+    """Store inferences as relationships on resolved entities.
+
+    Instead of creating polluting type="reference" entities for vague phrases
+    like "that place", we store the inference as a has_reference relationship
+    on the resolved entity with the reference phrase in metadata.
+    """
     if not inferences:
         return 0
 
-    from maasv.core.store import find_entity_by_name, find_or_create_entity, add_relationship
+    from maasv.core.graph import find_entity_by_name, find_or_create_entity, add_relationship
 
     stored = 0
     for inf in inferences:
@@ -162,21 +167,18 @@ def _store_inferences(inferences: list[dict]) -> int:
             else:
                 entity_id = entity["id"]
 
-            ref_entity_id = find_or_create_entity(
-                name=reference,
-                entity_type="reference",
-                metadata={"is_vague_reference": True}
-            )
-
+            # Store inference as a value-relationship on the resolved entity
+            # instead of creating a separate "reference" entity.
             add_relationship(
-                subject_id=ref_entity_id,
-                predicate="inferred_as",
-                object_id=entity_id,
+                subject_id=entity_id,
+                predicate="has_reference",
+                object_value=reference,
                 confidence=confidence * 0.8,
                 source="sleep_inference",
                 metadata={
                     "evidence": evidence,
-                    "inferred_at": datetime.now(timezone.utc).isoformat()
+                    "inferred_at": datetime.now(timezone.utc).isoformat(),
+                    "is_vague_reference": True,
                 }
             )
 

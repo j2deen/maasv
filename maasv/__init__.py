@@ -43,7 +43,7 @@ def init(config: MaasvConfig, llm: LLMProvider, embed: EmbedProvider) -> None:
     _initialized = True
 
     # Initialize database schema
-    from maasv.core.store import init_db
+    from maasv.core.db import init_db
     init_db()
 
     from maasv.core.wisdom import ensure_wisdom_tables

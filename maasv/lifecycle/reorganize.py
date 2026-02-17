@@ -49,7 +49,7 @@ def run_reorganize_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
 
 def _update_access_stats(focus_entities: list[str] = None):
     """Update access statistics for entities."""
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     db = get_db()
     try:
@@ -71,7 +71,7 @@ def _update_access_stats(focus_entities: list[str] = None):
 
 def _cache_common_paths() -> int:
     """Pre-compute and cache common traversal paths."""
-    from maasv.core.store import find_entity_by_name, get_entity_relationships
+    from maasv.core.graph import find_entity_by_name, get_entity_relationships
 
     cached = 0
 
@@ -119,7 +119,7 @@ def _cache_common_paths() -> int:
 
 def _store_cached_path(path_name: str, relationships: list[dict]):
     """Store a cached path for fast retrieval."""
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     db = get_db()
     try:
@@ -160,7 +160,7 @@ def _store_cached_path(path_name: str, relationships: list[dict]):
 
 def get_cached_path(path_name: str) -> list[dict] | None:
     """Retrieve a cached path if still valid. Returns None if not cached or expired."""
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     db = get_db()
     try:
@@ -187,7 +187,7 @@ def get_cached_path(path_name: str) -> list[dict] | None:
 
 def _cleanup_orphans() -> int:
     """Clean up orphaned entities (no relationships, created >7 days ago)."""
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     db = get_db()
     try:

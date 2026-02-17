@@ -11,28 +11,11 @@ experiential — patterns of what works and what doesn't, learned over time.
 import sqlite3
 import json
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
-
-def _get_conn() -> sqlite3.Connection:
-    """Get a database connection using the configured db_path."""
-    import maasv
-    conn = sqlite3.connect(str(maasv.get_config().db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-@contextmanager
-def _db():
-    """Context manager for database connections — ensures close on exception."""
-    conn = _get_conn()
-    try:
-        yield conn
-    finally:
-        conn.close()
+from maasv.core.db import _plain_db as _db
 
 
 @dataclass

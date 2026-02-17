@@ -210,11 +210,6 @@ def _is_protected(memory: dict) -> bool:
 
     category = memory.get("category", "").lower()
     subject = (memory.get("subject") or "").lower()
-    confidence = memory.get("confidence", 1.0)
-
-    # Never delete high-confidence memories
-    if confidence >= 0.9:
-        return True
 
     # Never delete protected categories
     if category in config.protected_categories:
@@ -269,7 +264,7 @@ def _deduplicate_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     so frequently-accessed duplicates don't lose their retrieval boost.
     """
     import maasv
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     config = maasv.get_config()
     similarity_threshold = config.similarity_threshold
@@ -477,7 +472,7 @@ def _prune_stale_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     - Subject not in protected list
     """
     import maasv
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     config = maasv.get_config()
 
@@ -537,7 +532,7 @@ def _deduplicate_relationships(dry_run: bool) -> dict:
 
     Keeps the row with highest confidence per group, deletes the rest.
     """
-    from maasv.core.store import get_db
+    from maasv.core.db import get_db
 
     stats = {"found": 0, "removed": 0}
     db = get_db()
@@ -623,7 +618,8 @@ def _deduplicate_entities(dry_run: bool) -> dict:
     Returns:
         {"found": int, "merged": int, "clusters": int}
     """
-    from maasv.core.store import get_db, merge_entity, normalize_entity_name
+    from maasv.core.db import get_db
+    from maasv.core.graph import merge_entity, normalize_entity_name
 
     stats = {"found": 0, "merged": 0, "clusters": 0}
     db = get_db()
@@ -717,7 +713,8 @@ def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     """
     import struct
     import maasv
-    from maasv.core.store import get_db, store_memory
+    from maasv.core.db import get_db
+    from maasv.core.store import store_memory
 
     config = maasv.get_config()
 

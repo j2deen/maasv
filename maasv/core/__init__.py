@@ -1,12 +1,16 @@
 from maasv.core.store import (
     store_memory,
-    find_similar_memories,
-    find_by_subject,
-    search_fts,
     get_all_active,
     get_recent_memories,
     delete_memory,
     supersede_memory,
+)
+from maasv.core.retrieval import (
+    find_similar_memories,
+    find_by_subject,
+    search_fts,
+)
+from maasv.core.graph import (
     create_entity,
     get_entity,
     find_entity_by_name,

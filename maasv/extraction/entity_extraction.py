@@ -202,7 +202,7 @@ class EntityExtractor:
 
     def store_extracted_entities(self, extraction_result: dict) -> dict:
         """Store extracted entities and relationships in the knowledge graph."""
-        from maasv.core.store import (
+        from maasv.core.graph import (
             find_or_create_entity,
             find_entity_by_name,
             add_relationship,
