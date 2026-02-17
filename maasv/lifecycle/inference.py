@@ -8,7 +8,7 @@ Uses the injected LLMProvider — no direct API calls.
 import logging
 import json
 from typing import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger("maasv.lifecycle.inference")
 
@@ -109,18 +109,15 @@ JSON output:"""
             source="sleep-inference",
         )
 
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
+        from maasv.utils import parse_llm_json
+        inferences = parse_llm_json(text)
 
-        inferences = json.loads(text)
+        if inferences is None:
+            logger.warning("[Inference] Failed to parse response")
+            return []
+
         logger.info(f"[Inference] Extracted {len(inferences)} inferences")
         return inferences
-
-    except json.JSONDecodeError as e:
-        logger.warning(f"[Inference] Failed to parse response: {e}")
-        return []
     except Exception as e:
         logger.error(f"[Inference] API call failed: {e}")
         return []
@@ -179,7 +176,7 @@ def _store_inferences(inferences: list[dict]) -> int:
                 source="sleep_inference",
                 metadata={
                     "evidence": evidence,
-                    "inferred_at": datetime.now().isoformat()
+                    "inferred_at": datetime.now(timezone.utc).isoformat()
                 }
             )
 

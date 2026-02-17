@@ -179,23 +179,11 @@ class EntityExtractor:
             )
 
             # Parse JSON from response
-            data = None
-            try:
-                data = json.loads(content.strip())
-            except json.JSONDecodeError:
-                try:
-                    if "```json" in content:
-                        stripped = content.split("```json")[1].split("```")[0]
-                    elif "```" in content:
-                        stripped = content.split("```")[1].split("```")[0]
-                    else:
-                        stripped = content
-                    data = json.loads(stripped.strip())
-                except (json.JSONDecodeError, IndexError) as e:
-                    logger.warning(f"Unparseable extraction response: {e}")
-                    return {"entities": [], "relationships": [], "status": "error", "error": str(e)}
+            from maasv.utils import parse_llm_json
+            data = parse_llm_json(content)
 
             if data is None:
+                logger.warning("Unparseable extraction response")
                 return {"entities": [], "relationships": [], "status": "error", "error": "No data parsed"}
 
             entities = data.get("entities", [])

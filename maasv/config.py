@@ -50,3 +50,20 @@ class MaasvConfig:
 
     # Hygiene log path (optional — if None, no log file written)
     hygiene_log_path: Optional[Path] = None
+
+    # Action type groupings for wisdom "similar enough" matching
+    action_families: dict[str, list[str]] = field(default_factory=dict)
+
+    # Category priority for tiered memory context (lower = higher priority)
+    category_priority: dict[str, int] = field(default_factory=lambda: {
+        'identity': 1,
+        'family': 2,
+        'preference': 3,
+        'project': 4,
+        'decision': 5,
+        'person': 6,
+        'learning': 7,
+        'history': 8,
+        'home': 9,
+        'conversation': 10,
+    })

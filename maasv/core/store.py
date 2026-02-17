@@ -8,6 +8,7 @@ All database paths and embedding calls come from the initialized config/provider
 """
 
 import logging
+import re
 import sqlite3
 import json
 import uuid
@@ -31,7 +32,13 @@ def _get_embed_dims():
 
 
 def get_db() -> sqlite3.Connection:
-    """Get database connection with sqlite-vec loaded."""
+    """Get database connection with sqlite-vec loaded.
+
+    NOTE: Each call opens a new connection and loads sqlite-vec. Functions use
+    _db() context manager for auto-close. At scale (>10K memories), consider
+    connection pooling to reduce overhead. Current hot path (find_similar_memories)
+    reuses a single connection for all 3 signals.
+    """
     import sqlite_vec
 
     db = sqlite3.connect(str(_get_db_path()))
@@ -348,7 +355,7 @@ def store_memory(
     Args:
         content: The fact or memory to store
         category: Type of memory (family, preference, project, decision, etc.)
-        subject: Who/what this is about (e.g., "Levi", "TerryAnn")
+        subject: Who/what this is about (e.g., "John", "ProjectX")
         source: Where this came from (manual, conversation, extracted)
         confidence: How confident we are (0.0-1.0)
         metadata: Additional structured data
@@ -363,8 +370,8 @@ def store_memory(
     # Compute embedding first (needed for both dedup check and storage)
     embedding = get_embedding(content)
 
-    # Dedup check: find near-duplicate via vector similarity
     with _db() as db:
+        # Dedup check: find near-duplicate via vector similarity
         try:
             rows = db.execute(
                 """
@@ -386,9 +393,9 @@ def store_memory(
                     )
                     return row['id']
         except Exception:
-            pass  # If dedup check fails, proceed with store
+            logger.debug("Dedup check failed, proceeding with store", exc_info=True)
 
-    with _db() as db:
+        # No duplicate found — insert
         memory_id = f"mem_{uuid.uuid4().hex[:12]}"
 
         db.execute("""
@@ -412,6 +419,64 @@ def store_memory(
         db.commit()
 
     return memory_id
+
+
+def _importance_score(
+    candidates: list[dict],
+    protected: set[str],
+    now: datetime,
+    vector_distances: dict[str, float],
+    bm25_ids: set[str],
+    graph_ids: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Score candidates by importance-weighted formula. Separates into primary
+    (have vector distance) and supplementary (no vector distance) lists,
+    both sorted by _imp_score descending.
+
+    Scoring: (1 - distance) * importance * decay * log(2 + access_count) + agreement_bonus
+    """
+    import math
+
+    primary = []
+    supplementary = []
+
+    for mem in candidates:
+        importance = mem.get('importance') or 0.5
+        access_count = mem.get('access_count') or 0
+
+        if mem.get('category') in protected:
+            decay_factor = 1.0
+        else:
+            try:
+                created = datetime.fromisoformat(mem['created_at'])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                days_old = (now - created).total_seconds() / 86400
+            except (ValueError, TypeError):
+                days_old = 0
+            decay_factor = math.exp(-days_old / 180)
+
+        dampened_access = min(access_count, 5)
+        distance = vector_distances.get(mem['id'])
+
+        if distance is not None:
+            base_score = (1.0 - distance) * importance * decay_factor * math.log(2 + dampened_access)
+            signal_count = 1
+            if mem['id'] in bm25_ids:
+                signal_count += 1
+            if mem['id'] in graph_ids:
+                signal_count += 1
+            mem['_imp_score'] = base_score + (signal_count - 1) * 0.01
+            primary.append(mem)
+        else:
+            mem['_imp_score'] = importance * decay_factor * math.log(2 + dampened_access) * 0.0001
+            supplementary.append(mem)
+
+    primary.sort(key=lambda m: m['_imp_score'], reverse=True)
+    supplementary.sort(key=lambda m: m['_imp_score'], reverse=True)
+
+    return primary, supplementary
 
 
 def find_similar_memories(
@@ -500,9 +565,14 @@ def find_similar_memories(
         bm25_ids = {r['id'] for r in bm25_results}
         graph_ids = {r['id'] for r in graph_results}
 
+        # === Importance scoring (shared by both CE and fallback paths) ===
+        primary, supplementary = _importance_score(
+            candidates, protected, now, vector_distances, bm25_ids, graph_ids
+        )
+
         if ce_scores is not None:
             # === Two-stage reranking ===
-            # Stage 1: Score with proven importance formula (9/10 baseline).
+            # Stage 1: importance scoring (done above).
             # Stage 2: CE reshuffles within top tier only.
             #
             # The MS MARCO cross-encoder prefers short exact matches over
@@ -512,48 +582,6 @@ def find_similar_memories(
             # importance determines WHICH memories are candidates, CE only
             # refines the ORDER within that set.
 
-            # Stage 1: importance scoring (same as fallback path)
-            primary = []
-            supplementary = []
-
-            for mem in candidates:
-                imp = mem.get('importance') or 0.5
-                acc = mem.get('access_count') or 0
-
-                if mem.get('category') in protected:
-                    decay = 1.0
-                else:
-                    try:
-                        created = datetime.fromisoformat(mem['created_at'])
-                        if created.tzinfo is None:
-                            created = created.replace(tzinfo=timezone.utc)
-                        days_old = (now - created).total_seconds() / 86400
-                    except (ValueError, TypeError):
-                        days_old = 0
-                    decay = math.exp(-days_old / 180)
-
-                dampened = min(acc, 5)
-                distance = vector_distances.get(mem['id'])
-
-                if distance is not None:
-                    base = (1.0 - distance) * imp * decay * math.log(2 + dampened)
-                    sc = 1
-                    if mem['id'] in bm25_ids:
-                        sc += 1
-                    if mem['id'] in graph_ids:
-                        sc += 1
-                    mem['_imp_score'] = base + (sc - 1) * 0.01
-                    primary.append(mem)
-                else:
-                    mem['_imp_score'] = imp * decay * math.log(2 + dampened) * 0.0001
-                    supplementary.append(mem)
-
-            primary.sort(key=lambda m: m['_imp_score'], reverse=True)
-            supplementary.sort(key=lambda m: m['_imp_score'], reverse=True)
-
-            # Stage 2: CE reranks the top tier (2x limit from primary + supplementary)
-            # This gives the CE room to improve ordering without displacing
-            # well-ranked memories from outside the window.
             rerank_size = min(limit * 2, len(primary) + len(supplementary))
             importance_ranked = (primary + supplementary)[:rerank_size]
 
@@ -592,45 +620,10 @@ def find_similar_memories(
                          if m['id'] not in reranked_ids]
             scored_pool = importance_ranked + remainder
         else:
-            # === Fallback: importance-weighted reranking (Phase 1 formula) ===
-            primary = []
-            supplementary = []
-
-            for mem in candidates:
-                importance = mem.get('importance') or 0.5
-                access_count = mem.get('access_count') or 0
-
-                if mem.get('category') in protected:
-                    decay_factor = 1.0
-                else:
-                    try:
-                        created = datetime.fromisoformat(mem['created_at'])
-                        if created.tzinfo is None:
-                            created = created.replace(tzinfo=timezone.utc)
-                        days_old = (now - created).total_seconds() / 86400
-                    except (ValueError, TypeError):
-                        days_old = 0
-                    decay_factor = math.exp(-days_old / 180)
-
-                dampened_access = min(access_count, 5)
-
-                distance = vector_distances.get(mem['id'])
-                if distance is not None:
-                    base_score = (1.0 - distance) * importance * decay_factor * math.log(2 + dampened_access)
-                    signal_count = 1
-                    if mem['id'] in bm25_ids:
-                        signal_count += 1
-                    if mem['id'] in graph_ids:
-                        signal_count += 1
-                    agreement_bonus = (signal_count - 1) * 0.01
-                    mem['_score'] = base_score + agreement_bonus
-                    primary.append(mem)
-                else:
-                    mem['_score'] = importance * decay_factor * math.log(2 + dampened_access) * 0.0001
-                    supplementary.append(mem)
-
-            primary.sort(key=lambda m: m['_score'], reverse=True)
-            supplementary.sort(key=lambda m: m['_score'], reverse=True)
+            # === Fallback: importance-weighted reranking ===
+            # Copy _imp_score to _score for downstream compatibility
+            for mem in primary + supplementary:
+                mem['_score'] = mem['_imp_score']
             scored_pool = primary + supplementary
 
         # === Diversity-aware selection (MMR-inspired) ===
@@ -666,7 +659,7 @@ def find_similar_memories(
         # If the graph signal found content (via 1-hop expansion) that didn't
         # make it into the top results, inject the graph result that mentions
         # the most graph-connected entity names. This ensures graph-discovered
-        # connections (e.g., Doris→FastAPI) surface even when importance scoring
+        # connections (e.g., MyApp→FastAPI) surface even when importance scoring
         # favors high-access vector matches.
         if graph_results and len(result) >= limit:
             result_ids = {m['id'] for m in result}
@@ -719,19 +712,25 @@ def find_similar_memories(
     return result
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards (%, _) in a value for safe use in LIKE patterns."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def find_by_subject(subject: str, active_only: bool = True) -> list[dict]:
     """Find all memories about a specific subject."""
+    escaped = _escape_like(subject)
     query = """
         SELECT id, content, category, subject, confidence, created_at, metadata
         FROM memories
-        WHERE subject LIKE ?
+        WHERE subject LIKE ? ESCAPE '\\'
     """
     if active_only:
         query += " AND superseded_by IS NULL"
     query += " ORDER BY created_at DESC"
 
     with _db() as db:
-        rows = db.execute(query, (f"%{subject}%",)).fetchall()
+        rows = db.execute(query, (f"%{escaped}%",)).fetchall()
 
     return [dict(row) for row in rows]
 
@@ -776,8 +775,8 @@ def _query_to_entity_fts(query: str) -> str:
     """
     Convert a natural-language query to OR-separated FTS5 terms for entity search.
 
-    FTS5 defaults to AND, so "Doris architecture" requires both words in entity
-    names — which misses the "Doris" entity. Converting to "Doris OR architecture"
+    FTS5 defaults to AND, so "MyApp architecture" requires both words in entity
+    names — which misses the "MyApp" entity. Converting to "MyApp OR architecture"
     ensures we find entities matching ANY query term.
 
     Strips FTS5 special characters and skips short/common words.
@@ -795,15 +794,13 @@ def _expand_query_from_graph(db: sqlite3.Connection, query: str) -> str:
     """
     Expand a query with related entity names from the knowledge graph.
 
-    "Doris architecture" → graph says Doris uses_tech FastAPI →
-    returns "Doris architecture OR FastAPI"
+    "MyApp architecture" → graph says MyApp uses_tech FastAPI →
+    returns "MyApp architecture OR FastAPI"
 
     This provides redundant coverage with _find_memories_by_graph():
     if graph signal or BM25 fails independently, the other catches it.
     """
     import re
-
-    NOISE_PREDICATES = {"inferred_as"}
 
     entity_fts_query = _query_to_entity_fts(query)
     try:
@@ -947,7 +944,7 @@ def _get_graph_expanded_names(db: sqlite3.Connection, query: str) -> set[str]:
             if r["name"] and r["name"] not in direct_names:
                 expanded.add(r["name"].lower())
     except Exception:
-        pass
+        logger.debug("Graph expansion query failed in _get_graph_expanded_names", exc_info=True)
 
     return expanded
 
@@ -963,18 +960,15 @@ def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50)
     4. Search memories_fts (FTS5) for content mentioning any entity name
     5. Fall back to subject LIKE matching if FTS yields too few results
 
-    The 1-hop expansion is what enables "Doris architecture" → Doris entity →
-    Doris-uses_tech→FastAPI → memories mentioning "FastAPI".
+    The 1-hop expansion is what enables "MyApp architecture" → MyApp entity →
+    MyApp-uses_tech→FastAPI → memories mentioning "FastAPI".
 
     Returns dicts with 'id' key (required for RRF) and 'graph_score'.
     """
     import re
 
-    # Noise predicates that provide no useful signal for retrieval
-    NOISE_PREDICATES = {"inferred_as"}
-
     # Step 1: Find entities mentioned in the query via FTS
-    # Convert to OR terms so "Doris architecture" matches "Doris" entity
+    # Convert to OR terms so "MyApp architecture" matches "MyApp" entity
     entity_fts_query = _query_to_entity_fts(query)
     try:
         entities = db.execute("""
@@ -1035,8 +1029,11 @@ def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50)
 
     # Step 3: Search memories_fts for content mentioning expanded entity names
     # AND a direct entity name. This cross-referencing ensures results are
-    # relevant to the original query context (e.g., "FastAPI" AND "Doris").
-    # Without the AND, searching 170+ tech entities from Doris returns noise.
+    # relevant to the original query context (e.g., "FastAPI" AND "MyApp").
+    # NOTE: Iterates per entity name (not batched) to differentiate graph_score
+    # (1.0 contextual vs 0.8 plain). Could batch into single OR query if
+    # graph_score differentiation is removed.
+    # Without the AND, searching a large number of tech entities returns noise.
     fts_results = []
     seen_fts_ids = set()
 
@@ -1044,7 +1041,7 @@ def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50)
         # Sort for deterministic iteration order (sets are unordered)
         sorted_expanded = sorted(expanded_entity_names)
 
-        # Build the direct entity part of the FTS query: "Doris" OR "architecture" etc.
+        # Build the direct entity part of the FTS query: "MyApp" OR "architecture" etc.
         direct_terms = []
         for name in direct_entity_names:
             clean = re.sub(r'[^\w\s]', '', name).strip()
@@ -1062,13 +1059,13 @@ def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50)
             # (with or without direct entity context depending on availability)
             fts_query = f'"{clean}"'
             if direct_clause:
-                # Prefer memories mentioning both: "FastAPI" AND ("Doris")
+                # Prefer memories mentioning both: "FastAPI" AND ("MyApp")
                 fts_query_with_context = f'({direct_clause}) AND "{clean}"'
             else:
                 fts_query_with_context = fts_query
 
             try:
-                # Try contextual query first (e.g., "Doris" AND "FastAPI")
+                # Try contextual query first (e.g., "MyApp" AND "FastAPI")
                 rows = db.execute("""
                     SELECT m.id, m.content, m.category, m.subject, m.confidence,
                            m.created_at, m.metadata, m.importance, m.access_count,
@@ -1152,6 +1149,8 @@ def _find_memories_by_graph(db: sqlite3.Connection, query: str, limit: int = 50)
     fts_results = fts_results[:limit]
 
     # Step 4: Fallback — subject LIKE matching (catches memories without FTS hits)
+    # NOTE: where_clause is built from entity names via parameterized LIKE (?).
+    # The column references are hardcoded strings, not user input.
     seen_ids = {r["id"] for r in fts_results}
     remaining = limit - len(fts_results)
 
@@ -1215,22 +1214,6 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], k: int = 60) -> list
         result.append(entry)
 
     return result
-
-
-def check_conflicts(content: str, subject: Optional[str] = None) -> list[dict]:
-    """Check if new memory conflicts with existing ones."""
-    conflicts = []
-
-    similar = find_similar_memories(content, limit=5)
-    conflicts.extend(similar)
-
-    if subject:
-        by_subject = find_by_subject(subject)
-        for mem in by_subject:
-            if not any(c['id'] == mem['id'] for c in conflicts):
-                conflicts.append(mem)
-
-    return conflicts
 
 
 def supersede_memory(old_id: str, new_content: str, source: str = "correction") -> str:
@@ -1337,44 +1320,14 @@ def update_memory_metadata(memory_id: str, metadata_updates: dict) -> bool:
     return True
 
 
-def get_unprocessed_thoughts() -> list[dict]:
-    """Get all unprocessed brain dump thoughts."""
-    with _db() as db:
-        rows = db.execute("""
-            SELECT id, content, category, subject, source, confidence, created_at, metadata
-            FROM memories
-            WHERE category = 'thought'
-            AND superseded_by IS NULL
-            ORDER BY created_at ASC
-        """).fetchall()
-
-    unprocessed = []
-    for row in rows:
-        row_dict = dict(row)
-        metadata = json.loads(row_dict['metadata']) if row_dict['metadata'] else {}
-        if not metadata.get('processed', False):
-            row_dict['_metadata'] = metadata
-            unprocessed.append(row_dict)
-
-    return unprocessed
-
-
 # ============================================================================
 # TIERED MEMORY CONTEXT
 # ============================================================================
 
-CATEGORY_PRIORITY = {
-    'family': 1,
-    'identity': 2,
-    'preference': 3,
-    'project': 4,
-    'decision': 5,
-    'person': 6,
-    'learning': 7,
-    'history': 8,
-    'home': 9,
-    'conversation': 10,
-}
+def _get_category_priority() -> dict[str, int]:
+    """Get category priority from config."""
+    import maasv
+    return maasv.get_config().category_priority
 
 _core_memories_cache: list[dict] = []
 _cache_timestamp: float = 0
@@ -1447,7 +1400,7 @@ def get_tiered_memory_context(
                     if len(memories) >= core_limit + relevant_limit:
                         break
         except Exception:
-            pass
+            logger.debug("FTS keyword search failed in tiered context", exc_info=True)
 
     # Tier 3: Semantic search as fallback (SLOW)
     if use_semantic and query and len(memories) < core_limit + relevant_limit:
@@ -1458,16 +1411,31 @@ def get_tiered_memory_context(
                 memories.append(mem)
                 seen_ids.add(mem['id'])
 
-    # Fill remaining slots with other memories by priority
-    if len(memories) < core_limit + relevant_limit:
-        all_mems = get_all_active()
-        all_mems.sort(key=lambda m: CATEGORY_PRIORITY.get(m['category'], 99))
-        for mem in all_mems:
-            if mem['id'] not in seen_ids:
-                memories.append(mem)
-                seen_ids.add(mem['id'])
-                if len(memories) >= core_limit + relevant_limit:
-                    break
+    # Fill remaining slots with other memories by priority.
+    # Fetch a bounded set (not all 5K+) ordered by importance, then sort by category priority in Python.
+    remaining_slots = (core_limit + relevant_limit) - len(memories)
+    if remaining_slots > 0:
+        category_priority = _get_category_priority()
+        # Over-fetch to account for seen_ids filtering, but cap at a reasonable limit
+        fetch_limit = remaining_slots * 3
+
+        with _db() as db:
+            filler_rows = db.execute("""
+                SELECT id, content, category, subject, confidence, created_at, importance
+                FROM memories
+                WHERE superseded_by IS NULL
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ?
+            """, (fetch_limit,)).fetchall()
+
+        filler_mems = [dict(row) for row in filler_rows if row['id'] not in seen_ids]
+        filler_mems.sort(key=lambda m: category_priority.get(m['category'], 99))
+
+        for mem in filler_mems:
+            memories.append(mem)
+            seen_ids.add(mem['id'])
+            if len(memories) >= core_limit + relevant_limit:
+                break
 
     if not memories:
         return ""
@@ -1548,15 +1516,70 @@ def find_entity_by_name(name: str, entity_type: Optional[str] = None) -> Optiona
     return None
 
 
+def normalize_entity_name(canonical_name: str) -> str:
+    """
+    Normalize a canonical_name for duplicate detection.
+
+    Used by hygiene cycle (entity dedup) and write-time prevention.
+
+    Steps:
+    1. Lowercase + strip
+    2. Replace hyphens with underscores
+    3. Strip parenthetical qualifiers: "foo_(bar_baz)" → "foo"
+    4. Strip domain suffixes (.sh, .dev, .js, .io, .ai, .py, etc.)
+    5. Strip trailing "s" if len > 4 (basic depluralization)
+    """
+    name = canonical_name.lower().strip()
+    name = name.replace("-", "_")
+    name = re.sub(r"_?\(.*?\)$", "", name)
+
+    for suffix in (".sh", ".dev", ".js", ".io", ".ai", ".py", ".rs", ".go"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+
+    if len(name) > 4 and name.endswith("s") and not name.endswith("ss"):
+        name = name[:-1]
+
+    return name
+
+
 def find_or_create_entity(
     name: str,
     entity_type: str,
     metadata: Optional[dict] = None
 ) -> str:
-    """Find existing entity or create new one. Returns entity ID."""
+    """
+    Find existing entity or create new one. Returns entity ID.
+
+    Lookup order:
+    1. Exact canonical_name match (fast, existing behavior)
+    2. Normalized name match within same entity_type (prevents near-duplicates
+       like "react-native" when "react_native" already exists)
+    """
+    # 1. Exact match (any type)
     existing = find_entity_by_name(name)
     if existing:
         return existing['id']
+
+    # 2. Normalized match (same type only — don't merge across types)
+    # NOTE: O(n) scan of all entities for this type. Fine at <1K entities.
+    # For 10K+, add a normalized_name column with an index.
+    incoming_norm = normalize_entity_name(name.lower().strip().replace(" ", "_"))
+    with _db() as db:
+        candidates = db.execute(
+            "SELECT id, canonical_name FROM entities WHERE entity_type = ?",
+            (entity_type,)
+        ).fetchall()
+        for row in candidates:
+            if normalize_entity_name(row["canonical_name"]) == incoming_norm:
+                _record_entity_access(db, [row["id"]])
+                logger.debug(
+                    f"[find_or_create_entity] Normalized match: '{name}' → "
+                    f"existing '{row['canonical_name']}' (type={entity_type})"
+                )
+                return row["id"]
+
     return create_entity(name, entity_type, metadata=metadata)
 
 

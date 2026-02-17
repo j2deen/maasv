@@ -8,7 +8,7 @@ Uses the injected LLMProvider — no direct API calls.
 import logging
 import json
 from typing import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger("maasv.lifecycle.review")
 
@@ -122,18 +122,15 @@ JSON output:"""
             source="sleep-review",
         )
 
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
+        from maasv.utils import parse_llm_json
+        insights = parse_llm_json(text)
 
-        insights = json.loads(text)
+        if insights is None:
+            logger.warning("[Review] Failed to parse response")
+            return []
+
         logger.info(f"[Review] Extracted {len(insights)} insights")
         return insights
-
-    except json.JSONDecodeError as e:
-        logger.warning(f"[Review] Failed to parse response: {e}")
-        return []
     except Exception as e:
         logger.error(f"[Review] API call failed: {e}")
         return []
@@ -173,7 +170,7 @@ def _store_insights(insights: list[dict]) -> int:
                 metadata={
                     "evidence": evidence,
                     "insight_type": insight_type,
-                    "reviewed_at": datetime.now().isoformat()
+                    "reviewed_at": datetime.now(timezone.utc).isoformat()
                 }
             )
 

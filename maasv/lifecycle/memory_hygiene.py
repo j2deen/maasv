@@ -12,7 +12,7 @@ All operations are audited and can be run in dry-run mode.
 import logging
 import json
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -29,6 +29,8 @@ class HygieneStats:
     stale_pruned: int = 0
     rel_duplicates_found: int = 0
     rel_duplicates_removed: int = 0
+    entity_dupes_found: int = 0
+    entity_dupes_merged: int = 0
     clusters_found: int = 0
     clusters_consolidated: int = 0
     errors: list = field(default_factory=list)
@@ -63,7 +65,7 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
 
     stats = HygieneStats(
         dry_run=dry_run,
-        started_at=datetime.now().isoformat()
+        started_at=datetime.now(timezone.utc).isoformat()
     )
 
     if cancel_check():
@@ -92,7 +94,7 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
             stats.errors.append(f"Dedup error: {e}")
 
     if cancel_check():
-        stats.completed_at = datetime.now().isoformat()
+        stats.completed_at = datetime.now(timezone.utc).isoformat()
         return {"stats": _stats_to_dict(stats), "cancelled": True}
 
     # Step 2: Prune stale
@@ -107,7 +109,7 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
             stats.errors.append(f"Prune error: {e}")
 
     if cancel_check():
-        stats.completed_at = datetime.now().isoformat()
+        stats.completed_at = datetime.now(timezone.utc).isoformat()
         return {"stats": _stats_to_dict(stats), "cancelled": True}
 
     # Step 3: Deduplicate relationships
@@ -122,10 +124,25 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
             stats.errors.append(f"Relationship dedup error: {e}")
 
     if cancel_check():
-        stats.completed_at = datetime.now().isoformat()
+        stats.completed_at = datetime.now(timezone.utc).isoformat()
         return {"stats": _stats_to_dict(stats), "cancelled": True}
 
-    # Step 4: Consolidate (only in full mode, expensive)
+    # Step 4: Deduplicate entities (normalization-based only — conservative)
+    if not cancel_check():
+        try:
+            ent_dedup_stats = _deduplicate_entities(dry_run)
+            stats.entity_dupes_found = ent_dedup_stats["found"]
+            stats.entity_dupes_merged = ent_dedup_stats["merged"]
+            logger.info(f"[MemoryHygiene] Entity dedup: found {stats.entity_dupes_found} dupes in {ent_dedup_stats['clusters']} clusters, merged {stats.entity_dupes_merged}")
+        except Exception as e:
+            logger.error(f"[MemoryHygiene] Entity dedup failed: {e}", exc_info=True)
+            stats.errors.append(f"Entity dedup error: {e}")
+
+    if cancel_check():
+        stats.completed_at = datetime.now(timezone.utc).isoformat()
+        return {"stats": _stats_to_dict(stats), "cancelled": True}
+
+    # Step 5: Consolidate (only in full mode, expensive)
     if do_consolidate and mode == "full" and not cancel_check():
         try:
             consolidate_stats = _consolidate_clusters(dry_run, cancel_check)
@@ -136,7 +153,7 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
             logger.error(f"[MemoryHygiene] Consolidate failed: {e}", exc_info=True)
             stats.errors.append(f"Consolidate error: {e}")
 
-    stats.completed_at = datetime.now().isoformat()
+    stats.completed_at = datetime.now(timezone.utc).isoformat()
     _log_hygiene_run(stats)
 
     return {"stats": _stats_to_dict(stats), "cancelled": False}
@@ -155,7 +172,7 @@ def _create_backup() -> Optional[Path]:
     try:
         backup_dir = config.backup_dir / "memory_hygiene"
         backup_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_path = backup_dir / f"pre_hygiene_{timestamp}.db"
         shutil.copy2(config.db_path, backup_path)
 
@@ -228,8 +245,8 @@ def _is_protected_from_dedup(memory: dict) -> bool:
     subject = (memory.get("subject") or "").lower()
 
     # Protected categories can still be deduped (family memories often duplicate)
-    # Protected subjects can still be deduped (Adam memories often duplicate)
-    # The ONLY hard protection: identity category (e.g., "Adam is 38 years old")
+    # Protected subjects can still be deduped (user memories often duplicate)
+    # The ONLY hard protection: identity category (e.g., "User is 38 years old")
     if category == "identity":
         return True
 
@@ -468,7 +485,7 @@ def _prune_stale_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     db = get_db()
 
     try:
-        cutoff_date = (datetime.now() - timedelta(days=config.stale_days)).isoformat()
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=config.stale_days)).isoformat()
 
         # Find stale, low-confidence memories
         candidates = db.execute("""
@@ -495,7 +512,7 @@ def _prune_stale_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
                 "content": mem["content"][:100],
                 "category": mem["category"],
                 "confidence": mem["confidence"],
-                "age_days": (datetime.now() - datetime.fromisoformat(mem["created_at"])).days
+                "age_days": (datetime.now(timezone.utc) - datetime.fromisoformat(mem["created_at"])).days
             })
 
             if not dry_run:
@@ -591,6 +608,104 @@ def _deduplicate_relationships(dry_run: bool) -> dict:
     return stats
 
 
+def _deduplicate_entities(dry_run: bool) -> dict:
+    """
+    Find and merge near-duplicate entities using normalization-based matching.
+
+    Conservative: only uses normalize_entity_name() to find exact matches after
+    normalization (hyphens→underscores, strip plurals/domains/qualifiers).
+    No fuzzy matching — that's too risky without human review.
+
+    Groups entities by type, then by normalized name within each type.
+    For each group of 2+, selects keeper (most relationships → shortest name →
+    highest access → most recent) and merges the rest via merge_entity().
+
+    Returns:
+        {"found": int, "merged": int, "clusters": int}
+    """
+    from maasv.core.store import get_db, merge_entity, normalize_entity_name
+
+    stats = {"found": 0, "merged": 0, "clusters": 0}
+    db = get_db()
+
+    try:
+        # Load all entities
+        all_entities = [dict(r) for r in db.execute(
+            "SELECT id, name, entity_type, canonical_name, access_count, created_at "
+            "FROM entities"
+        ).fetchall()]
+
+        if len(all_entities) < 2:
+            return stats
+
+        # Get relationship counts per entity
+        rel_count_rows = db.execute("""
+            SELECT entity_id, SUM(cnt) as total FROM (
+                SELECT subject_id as entity_id, COUNT(*) as cnt
+                FROM relationships WHERE valid_to IS NULL GROUP BY subject_id
+                UNION ALL
+                SELECT object_id as entity_id, COUNT(*) as cnt
+                FROM relationships WHERE valid_to IS NULL AND object_id IS NOT NULL
+                GROUP BY object_id
+            ) GROUP BY entity_id
+        """).fetchall()
+        rel_counts = {r["entity_id"]: r["total"] for r in rel_count_rows}
+
+        # Group by (entity_type, normalized_name) to find duplicates
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for ent in all_entities:
+            norm = normalize_entity_name(ent["canonical_name"])
+            key = (ent["entity_type"], norm)
+            groups[key].append(ent)
+
+        # Process groups with 2+ members
+        for (etype, norm_name), members in groups.items():
+            if len(members) < 2:
+                continue
+
+            stats["clusters"] += 1
+            stats["found"] += len(members) - 1  # all but keeper
+
+            if dry_run:
+                names = [m["canonical_name"] for m in members]
+                logger.info(
+                    f"[MemoryHygiene] Entity dedup (dry): {etype}/{norm_name} "
+                    f"→ {len(members)} members: {names}"
+                )
+                continue
+
+            # Keeper selection: most rels → shortest name → highest access → most recent
+            members.sort(key=lambda m: (
+                rel_counts.get(m["id"], 0),
+                -len(m.get("canonical_name") or ""),
+                m.get("access_count") or 0,
+                m.get("created_at") or "",
+            ), reverse=True)
+
+            keeper = members[0]
+            dup_ids = [m["id"] for m in members[1:]]
+
+            try:
+                merge_stats = merge_entity(keeper["id"], dup_ids)
+                stats["merged"] += merge_stats["entities_deleted"]
+                logger.info(
+                    f"[MemoryHygiene] Entity dedup: merged {dup_ids} into "
+                    f"{keeper['canonical_name']} ({merge_stats['entities_deleted']} deleted, "
+                    f"{merge_stats['relationships_updated']} rels updated)"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[MemoryHygiene] Entity dedup: failed merging into "
+                    f"{keeper['canonical_name']}: {e}", exc_info=True
+                )
+
+    finally:
+        db.close()
+
+    return stats
+
+
 def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> dict:
     """
     Find clusters of related memories and consolidate into stronger single memories.
@@ -600,8 +715,9 @@ def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     - Same subject
     - Similarity > cluster_similarity threshold
     """
+    import struct
     import maasv
-    from maasv.core.store import get_db, store_memory, get_embedding
+    from maasv.core.store import get_db, store_memory
 
     config = maasv.get_config()
 
@@ -620,6 +736,17 @@ def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> di
         """).fetchall()
 
         memories = [dict(m) for m in memories]
+
+        # Pre-load embeddings from DB instead of recomputing (O(n) reads vs O(n²) API calls)
+        embedding_cache = {}
+        for mem in memories:
+            row = db.execute(
+                "SELECT embedding FROM memory_vectors WHERE id = ?", (mem["id"],)
+            ).fetchone()
+            if row and row["embedding"]:
+                # Deserialize float32 binary blob
+                blob = row["embedding"]
+                embedding_cache[mem["id"]] = struct.unpack(f'{len(blob)//4}f', blob)
 
         # Group by subject
         by_subject = {}
@@ -646,18 +773,21 @@ def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> di
                     break
                 if mem["id"] in used:
                     continue
+                if mem["id"] not in embedding_cache:
+                    continue
 
                 cluster = [mem]
                 used.add(mem["id"])
 
-                query_embedding = get_embedding(mem["content"])
+                query_embedding = embedding_cache[mem["id"]]
 
                 for other in mems:
                     if other["id"] in used:
                         continue
+                    if other["id"] not in embedding_cache:
+                        continue
 
-                    # Check similarity
-                    other_embedding = get_embedding(other["content"])
+                    other_embedding = embedding_cache[other["id"]]
                     # Cosine similarity (assuming normalized)
                     similarity = sum(a * b for a, b in zip(query_embedding, other_embedding))
 
@@ -788,6 +918,10 @@ def _stats_to_dict(stats: HygieneStats) -> dict:
         "duplicates_merged": stats.duplicates_merged,
         "stale_found": stats.stale_found,
         "stale_pruned": stats.stale_pruned,
+        "rel_duplicates_found": stats.rel_duplicates_found,
+        "rel_duplicates_removed": stats.rel_duplicates_removed,
+        "entity_dupes_found": stats.entity_dupes_found,
+        "entity_dupes_merged": stats.entity_dupes_merged,
         "clusters_found": stats.clusters_found,
         "clusters_consolidated": stats.clusters_consolidated,
         "errors": stats.errors,

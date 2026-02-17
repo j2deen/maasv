@@ -4,14 +4,15 @@ maasv Wisdom: Learnings from experience.
 Captures reasoning before actions, tracks outcomes,
 and incorporates feedback to improve future decisions.
 
-Unlike factual memory (who is Gabby, what's Adam's schedule), wisdom is
+Unlike factual memory (who is the user's spouse, what's their schedule), wisdom is
 experiential — patterns of what works and what doesn't, learned over time.
 """
 
 import sqlite3
 import json
 import uuid
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -24,13 +25,23 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _db():
+    """Context manager for database connections — ensures close on exception."""
+    conn = _get_conn()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 @dataclass
 class WisdomEntry:
     """A single piece of experiential wisdom."""
     action_type: str
     reasoning: str
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     action_data: Optional[dict] = None
     trigger: Optional[str] = None
     context: Optional[str] = None
@@ -45,8 +56,7 @@ class WisdomEntry:
 
 def ensure_wisdom_tables():
     """Create wisdom and wisdom_fts tables if they don't exist."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS wisdom (
                 id TEXT PRIMARY KEY,
@@ -96,8 +106,6 @@ def ensure_wisdom_tables():
             END
         """)
         conn.commit()
-    finally:
-        conn.close()
 
 
 def log_reasoning(
@@ -118,8 +126,7 @@ def log_reasoning(
         tags=tags,
     )
 
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         conn.execute(
             """
             INSERT INTO wisdom (id, timestamp, action_type, action_data, trigger,
@@ -135,22 +142,17 @@ def log_reasoning(
         )
         conn.commit()
         return entry.id
-    finally:
-        conn.close()
 
 
 def record_outcome(wisdom_id: str, outcome: str, details: str = None) -> bool:
     """Record the outcome of an action."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         cursor = conn.execute(
             "UPDATE wisdom SET outcome = ?, outcome_details = ? WHERE id = ?",
             (outcome, details, wisdom_id)
         )
         conn.commit()
         return cursor.rowcount > 0
-    finally:
-        conn.close()
 
 
 def add_feedback(wisdom_id: str, score: int, notes: str = None) -> bool:
@@ -158,16 +160,13 @@ def add_feedback(wisdom_id: str, score: int, notes: str = None) -> bool:
     if not 1 <= score <= 5:
         raise ValueError("Score must be between 1 and 5")
 
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         cursor = conn.execute(
             "UPDATE wisdom SET feedback_score = ?, feedback_notes = ?, feedback_at = ? WHERE id = ?",
-            (score, notes, datetime.now().isoformat(), wisdom_id)
+            (score, notes, datetime.now(timezone.utc).isoformat(), wisdom_id)
         )
         conn.commit()
         return cursor.rowcount > 0
-    finally:
-        conn.close()
 
 
 def get_relevant_wisdom(
@@ -176,8 +175,7 @@ def get_relevant_wisdom(
     include_unrated: bool = False,
 ) -> list[dict]:
     """Get relevant wisdom for a given action type, prioritizing failures."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         if include_unrated:
             query = """
                 SELECT * FROM wisdom
@@ -204,14 +202,11 @@ def get_relevant_wisdom(
             rows = conn.execute(query, (action_type, limit)).fetchall()
 
         return [_row_to_dict(row) for row in rows]
-    finally:
-        conn.close()
 
 
 def search_wisdom(query: str, limit: int = 10) -> list[dict]:
     """Full-text search across reasoning, context, and feedback."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         rows = conn.execute(
             """
             SELECT w.* FROM wisdom w
@@ -223,39 +218,30 @@ def search_wisdom(query: str, limit: int = 10) -> list[dict]:
             (query, limit)
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
-    finally:
-        conn.close()
 
 
 def get_wisdom_by_id(wisdom_id: str) -> Optional[dict]:
     """Get a specific wisdom entry by ID."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         row = conn.execute(
             "SELECT * FROM wisdom WHERE id = ?", (wisdom_id,)
         ).fetchone()
         return _row_to_dict(row) if row else None
-    finally:
-        conn.close()
 
 
 def get_recent_wisdom(limit: int = 10) -> list[dict]:
     """Get the most recent wisdom entries."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM wisdom ORDER BY timestamp DESC LIMIT ?",
             (limit,)
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
-    finally:
-        conn.close()
 
 
 def get_pending_feedback(limit: int = 20) -> list[dict]:
     """Get wisdom entries that haven't received feedback yet."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         rows = conn.execute(
             """
             SELECT * FROM wisdom
@@ -267,8 +253,6 @@ def get_pending_feedback(limit: int = 20) -> list[dict]:
             (limit,)
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
-    finally:
-        conn.close()
 
 
 def format_wisdom_for_prompt(entries: list[dict]) -> str:
@@ -297,17 +281,18 @@ def format_wisdom_for_prompt(entries: list[dict]) -> str:
 
 def delete_wisdom(wisdom_id: str) -> bool:
     """Delete a wisdom entry."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         cursor = conn.execute("DELETE FROM wisdom WHERE id = ?", (wisdom_id,))
         conn.commit()
         return cursor.rowcount > 0
-    finally:
-        conn.close()
 
 
 def update_wisdom(wisdom_id: str, **kwargs) -> bool:
-    """Update fields on a wisdom entry."""
+    """Update fields on a wisdom entry.
+
+    NOTE: Column names in set_clause come from allowed_fields intersection,
+    not user input. If adding fields here, ensure names are safe SQL identifiers.
+    """
     allowed_fields = {
         "reasoning", "context", "outcome", "outcome_details",
         "feedback_score", "feedback_notes", "tags"
@@ -323,22 +308,18 @@ def update_wisdom(wisdom_id: str, **kwargs) -> bool:
     set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
     values = list(updates.values()) + [wisdom_id]
 
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         cursor = conn.execute(
             f"UPDATE wisdom SET {set_clause} WHERE id = ?",
             values
         )
         conn.commit()
         return cursor.rowcount > 0
-    finally:
-        conn.close()
 
 
 def get_stats() -> dict:
     """Get statistics about the wisdom database."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM wisdom").fetchone()[0]
         rated = conn.execute(
             "SELECT COUNT(*) FROM wisdom WHERE feedback_score IS NOT NULL"
@@ -365,38 +346,42 @@ def get_stats() -> dict:
             "average_score": round(avg_score, 2) if avg_score else None,
             "by_action_type": [dict(row) for row in by_action],
         }
-    finally:
-        conn.close()
 
 
-# Action type groupings for "similar enough" matching
-ACTION_FAMILIES = {
-    "calendar": ["create_calendar_event", "move_calendar_event", "delete_calendar_event"],
-    "reminders": ["create_reminder", "complete_reminder"],
-    "messaging": ["send_imessage", "send_email"],
-    "home": ["control_lights", "control_music", "home_announce"],
-    "memory": ["store_memory"],
-    "notifications": ["notify_adam"],
-    "creative": ["create_image", "create_note"],
-    "escalation": ["email_escalation_miss", "email_escalation_correct", "calendar_escalation_miss"],
-}
+def _get_action_families() -> dict[str, list[str]]:
+    """Get action families from config."""
+    import maasv
+    try:
+        return maasv.get_config().action_families
+    except RuntimeError:
+        return {}
 
-_ACTION_TO_FAMILY = {}
-for family, actions in ACTION_FAMILIES.items():
-    for action in actions:
-        _ACTION_TO_FAMILY[action] = family
+
+def _build_action_to_family() -> dict[str, str]:
+    """Build reverse lookup from action type to family name.
+
+    NOTE: Rebuilt on every call. Cheap for small configs (typical: <20 entries).
+    Cache at module level if action_families grows large.
+    """
+    families = _get_action_families()
+    mapping = {}
+    for family, actions in families.items():
+        for action in actions:
+            mapping[action] = family
+    return mapping
 
 
 def get_action_family(action_type: str) -> Optional[str]:
     """Get the family name for an action type."""
-    return _ACTION_TO_FAMILY.get(action_type)
+    return _build_action_to_family().get(action_type)
 
 
 def get_family_actions(action_type: str) -> list[str]:
     """Get all action types in the same family as the given action."""
-    family = _ACTION_TO_FAMILY.get(action_type)
+    mapping = _build_action_to_family()
+    family = mapping.get(action_type)
     if family:
-        return ACTION_FAMILIES[family]
+        return _get_action_families()[family]
     return [action_type]
 
 
@@ -406,8 +391,7 @@ def should_query_wisdom(
     threshold_failure_rate: float = 0.1
 ) -> tuple[bool, str]:
     """Determine if we should query wisdom before executing an action."""
-    conn = _get_conn()
-    try:
+    with _db() as conn:
         stats = conn.execute(
             """
             SELECT
@@ -435,8 +419,6 @@ def should_query_wisdom(
                 return True, f"high failure rate ({failure_rate:.0%})"
 
         return False, f"well-established ({total} executions, {failures} failures)"
-    finally:
-        conn.close()
 
 
 def get_smart_wisdom(
@@ -445,10 +427,9 @@ def get_smart_wisdom(
     limit: int = 5,
 ) -> list[dict]:
     """Get relevant wisdom using smart matching across action families."""
-    conn = _get_conn()
     results = []
 
-    try:
+    with _db() as conn:
         # 1. Exact matches with failures or feedback
         exact_rows = conn.execute(
             """
@@ -522,9 +503,6 @@ def get_smart_wisdom(
 
         return results[:limit]
 
-    finally:
-        conn.close()
-
 
 def format_smart_wisdom_for_prompt(entries: list[dict]) -> str:
     """Format smart wisdom entries for inclusion in a prompt."""
@@ -564,6 +542,10 @@ def format_smart_wisdom_for_prompt(entries: list[dict]) -> str:
 
 # ============================================================================
 # Escalation Wisdom
+#
+# Higher-level convenience functions for tracking escalation decisions.
+# Useful for agents that monitor external sources (email, calendar, feeds)
+# and need to learn which items warrant user notification.
 # ============================================================================
 
 def log_escalation_miss(
@@ -623,17 +605,14 @@ def log_escalation_correct(
 
 
 def get_escalation_patterns(source: str, limit: int = 10) -> list[dict]:
-    """Get escalation patterns to help scouts make better decisions."""
-    conn = _get_conn()
-    try:
+    """Get escalation patterns to help agents make better decisions."""
+    with _db() as conn:
         miss_action = f"{source}_escalation_miss"
         rows = conn.execute(
             "SELECT * FROM wisdom WHERE action_type = ? ORDER BY timestamp DESC LIMIT ?",
             (miss_action, limit)
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
-    finally:
-        conn.close()
 
 
 def should_escalate_based_on_wisdom(

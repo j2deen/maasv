@@ -1,7 +1,7 @@
 """
 Provider protocols for dependency injection.
 
-Consumers (e.g., Doris) implement these and pass them to maasv.init().
+Consumers (e.g., your AI agent) implement these and pass them to maasv.init().
 maasv never imports LLM or embedding libraries directly.
 """
 

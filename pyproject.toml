@@ -8,13 +8,33 @@ version = "0.1.0"
 description = "Cognition layer for AI agents — memory lifecycle engine"
 requires-python = ">=3.11"
 license = {text = "BSL-1.1"}
+authors = [
+    {name = "Adam Bell"},
+]
+readme = "README.md"
+keywords = ["memory", "knowledge-graph", "ai-agents", "cognition", "rag"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
 dependencies = [
-    "sqlite-vec>=0.1.1",
+    "sqlite-vec>=0.1.1,<1.0",
 ]
 
 [project.optional-dependencies]
-ollama = ["ollama>=0.4.0"]
-sentence-transformers = ["sentence-transformers>=2.0.0"]
+reranking = [
+    "sentence-transformers>=2.0.0",
+    # NOTE: pulls in torch (~2GB). Only needed if cross_encoder_enabled=True.
+]
+
+[project.urls]
+Homepage = "https://maasv.com"
+Repository = "https://github.com/TODO/maasv"
 
 [tool.setuptools.packages.find]
 include = ["maasv*"]
+exclude = ["scripts*", "examples*"]

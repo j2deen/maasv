@@ -7,3 +7,4 @@ build/
 .eggs/
 *.egg
 .venv/
+.enrich_checkpoint.json

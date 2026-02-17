@@ -9,8 +9,9 @@ Optimizes the knowledge graph for faster retrieval:
 
 import logging
 import json
+import sqlite3
 from typing import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("maasv.lifecycle.reorganize")
 
@@ -43,13 +44,6 @@ def run_reorganize_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
         results["cleaned"] = cleaned
         results["optimizations"].append("cleaned_orphans")
 
-    if cancel_check():
-        return {**results, "cancelled": True}
-
-    strengthened = _strengthen_frequent_connections()
-    if strengthened:
-        results["optimizations"].append("strengthened_connections")
-
     return results
 
 
@@ -57,26 +51,27 @@ def _update_access_stats(focus_entities: list[str] = None):
     """Update access statistics for entities."""
     from maasv.core.store import get_db
 
+    db = get_db()
     try:
-        db = get_db()
         try:
             db.execute("ALTER TABLE entities ADD COLUMN access_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         try:
             db.execute("ALTER TABLE entities ADD COLUMN last_accessed_at TEXT")
-        except Exception:
-            pass
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         db.commit()
-        db.close()
         logger.debug("[Reorganize] Updated access stats schema")
     except Exception as e:
         logger.warning(f"[Reorganize] Failed to update access stats: {e}")
+    finally:
+        db.close()
 
 
 def _cache_common_paths() -> int:
     """Pre-compute and cache common traversal paths."""
-    from maasv.core.store import get_db, find_entity_by_name, get_entity_relationships
+    from maasv.core.store import find_entity_by_name, get_entity_relationships
 
     cached = 0
 
@@ -126,8 +121,8 @@ def _store_cached_path(path_name: str, relationships: list[dict]):
     """Store a cached path for fast retrieval."""
     from maasv.core.store import get_db
 
+    db = get_db()
     try:
-        db = get_db()
         db.execute("""
             CREATE TABLE IF NOT EXISTS cached_paths (
                 name TEXT PRIMARY KEY,
@@ -137,7 +132,7 @@ def _store_cached_path(path_name: str, relationships: list[dict]):
             )
         """)
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         expires = now + timedelta(hours=1)
 
         simplified = []
@@ -157,29 +152,28 @@ def _store_cached_path(path_name: str, relationships: list[dict]):
         """, (path_name, json.dumps(simplified), now.isoformat(), expires.isoformat()))
 
         db.commit()
-        db.close()
-
     except Exception as e:
         logger.warning(f"[Reorganize] Failed to store cached path '{path_name}': {e}")
+    finally:
+        db.close()
 
 
 def get_cached_path(path_name: str) -> list[dict] | None:
     """Retrieve a cached path if still valid. Returns None if not cached or expired."""
     from maasv.core.store import get_db
 
+    db = get_db()
     try:
-        db = get_db()
         row = db.execute(
             "SELECT data, expires_at FROM cached_paths WHERE name = ?",
             (path_name,)
         ).fetchone()
-        db.close()
 
         if not row:
             return None
 
         expires_at = datetime.fromisoformat(row["expires_at"])
-        if datetime.now() > expires_at:
+        if datetime.now(timezone.utc) > expires_at:
             return None
 
         return json.loads(row["data"])
@@ -187,15 +181,17 @@ def get_cached_path(path_name: str) -> list[dict] | None:
     except Exception as e:
         logger.warning(f"[Reorganize] Failed to get cached path '{path_name}': {e}")
         return None
+    finally:
+        db.close()
 
 
 def _cleanup_orphans() -> int:
     """Clean up orphaned entities (no relationships, created >7 days ago)."""
     from maasv.core.store import get_db
 
+    db = get_db()
     try:
-        db = get_db()
-        cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
         orphans = db.execute("""
             SELECT e.id FROM entities e
@@ -214,15 +210,10 @@ def _cleanup_orphans() -> int:
             db.commit()
             logger.info(f"[Reorganize] Cleaned {len(orphan_ids)} orphaned entities")
 
-        db.close()
         return len(orphan_ids)
 
     except Exception as e:
         logger.warning(f"[Reorganize] Failed to cleanup orphans: {e}")
         return 0
-
-
-def _strengthen_frequent_connections() -> bool:
-    """Placeholder for connection strengthening based on co-access patterns."""
-    logger.debug("[Reorganize] Connection strengthening not yet implemented")
-    return False
+    finally:
+        db.close()
