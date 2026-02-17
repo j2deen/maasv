@@ -1,10 +1,32 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.egg-info/
 dist/
 build/
 .eggs/
 *.egg
+
+# Virtual environments
 .venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Testing
+.pytest_cache/
+
+# Databases
+*.db
+*.db-journal
+
+# Project-specific
 .enrich_checkpoint.json

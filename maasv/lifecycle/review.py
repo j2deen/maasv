@@ -103,7 +103,6 @@ For each insight, provide:
 - type: pattern, preference, connection, or follow_up
 - insight: Clear description
 - evidence: Quote or reference from conversation
-- actionable: Whether the assistant should do something with this
 - confidence: 0.0-1.0
 
 Return as JSON array. Only include genuinely valuable insights, not obvious ones.

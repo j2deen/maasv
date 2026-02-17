@@ -33,4 +33,7 @@ def parse_llm_json(content: str) -> dict | list | None:
             return None
         return json.loads(stripped.strip())
     except (json.JSONDecodeError, IndexError):
-        return None
+        pass
+
+    logger.warning("Failed to parse LLM JSON: %s", content[:200])
+    return None

@@ -1,14 +1,18 @@
 """
-Integration test for the store.py decomposition.
+Integration tests for the maasv decomposition.
 
-Verifies that all modules (db, store, retrieval, graph) work correctly
+Verifies that all modules (db, store, retrieval, graph, wisdom) work correctly
 after being extracted from the monolithic store.py.
+
+Uses a shared temp DB per session via module-scoped fixture.
 """
 
-import os
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
+
 
 # ============================================================================
 # MOCK PROVIDERS
@@ -25,7 +29,6 @@ class MockEmbedProvider:
         import hashlib
         h = hashlib.sha256(text.encode()).digest()
         vec = [b / 255.0 for b in h]
-        # Pad/truncate to dims
         while len(vec) < self.dims:
             vec.extend(vec)
         return vec[:self.dims]
@@ -41,17 +44,21 @@ class MockLLMProvider:
 
     def call(self, messages, model, max_tokens, source=""):
         self.call_count += 1
-        return "[]"  # Empty JSON array (safe default)
+        return "[]"
 
 
 # ============================================================================
-# TEST HELPERS
+# FIXTURES
 # ============================================================================
 
-def setup_maasv(db_path: Path):
-    """Initialize maasv with a fresh test database."""
+@pytest.fixture(scope="module")
+def maasv_db(tmp_path_factory):
+    """Initialize maasv with a fresh test database (shared across module)."""
     from maasv.config import MaasvConfig
     import maasv
+
+    tmpdir = tmp_path_factory.mktemp("maasv_test")
+    db_path = tmpdir / "test.db"
 
     config = MaasvConfig(
         db_path=db_path,
@@ -66,354 +73,299 @@ def setup_maasv(db_path: Path):
     embed = MockEmbedProvider(dims=64)
 
     maasv.init(config=config, llm=llm, embed=embed)
-    return llm, embed
+    return {"llm": llm, "embed": embed, "db_path": db_path}
 
 
-def run_tests():
-    errors = []
-    passed = 0
+# ============================================================================
+# db.py tests
+# ============================================================================
 
-    def check(name, fn):
-        nonlocal passed
-        try:
-            fn()
-            print(f"  PASS: {name}")
-            passed += 1
-        except Exception as e:
-            print(f"  FAIL: {name} — {e}")
-            errors.append((name, e))
+class TestDB:
+    def test_connection(self, maasv_db):
+        from maasv.core.db import get_db
+        db = get_db()
+        assert db is not None
+        row = db.execute("SELECT vec_version()").fetchone()
+        assert row is not None
+        db.close()
 
-    # Create fresh DB in temp dir
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test.db"
-        llm, embed = setup_maasv(db_path)
+    def test_plain_connection(self, maasv_db):
+        from maasv.core.db import get_plain_db
+        db = get_plain_db()
+        assert db is not None
+        db.execute("SELECT 1").fetchone()
+        db.close()
 
-        print("\n=== db.py tests ===")
+    def test_tables_exist(self, maasv_db):
+        from maasv.core.db import get_db
+        db = get_db()
+        tables = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        table_names = {row['name'] for row in tables}
+        assert 'memories' in table_names
+        assert 'entities' in table_names
+        assert 'relationships' in table_names
+        assert 'schema_migrations' in table_names
+        db.close()
 
-        def test_db_connection():
-            from maasv.core.db import get_db, _db
-            db = get_db()
-            assert db is not None
-            # Verify sqlite-vec is loaded
-            row = db.execute("SELECT vec_version()").fetchone()
-            assert row is not None
-            db.close()
+    def test_embeddings(self, maasv_db):
+        from maasv.core.db import get_embedding, get_query_embedding, serialize_embedding
+        emb = get_embedding("test text")
+        assert len(emb) == 64
+        assert isinstance(emb[0], float)
+        q_emb = get_query_embedding("test query")
+        assert len(q_emb) == 64
+        serialized = serialize_embedding(emb)
+        assert isinstance(serialized, bytes)
 
-        def test_plain_db_connection():
-            from maasv.core.db import get_plain_db, _plain_db
-            db = get_plain_db()
-            assert db is not None
-            # Should work for basic queries
-            db.execute("SELECT 1").fetchone()
-            db.close()
 
-        def test_db_tables_exist():
-            from maasv.core.db import get_db
-            db = get_db()
-            tables = db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-            table_names = {row['name'] for row in tables}
-            assert 'memories' in table_names
-            assert 'entities' in table_names
-            assert 'relationships' in table_names
-            assert 'schema_migrations' in table_names
-            db.close()
+# ============================================================================
+# store.py tests
+# ============================================================================
 
-        def test_embeddings():
-            from maasv.core.db import get_embedding, get_query_embedding, serialize_embedding
-            emb = get_embedding("test text")
-            assert len(emb) == 64
-            assert isinstance(emb[0], float)
-            q_emb = get_query_embedding("test query")
-            assert len(q_emb) == 64
-            serialized = serialize_embedding(emb)
-            assert isinstance(serialized, bytes)
+class TestStore:
+    def test_store_memory(self, maasv_db):
+        from maasv.core.store import store_memory
+        mid = store_memory(
+            content="Adam lives on the Upper West Side",
+            category="identity",
+            subject="Adam",
+            source="test",
+        )
+        assert mid.startswith("mem_")
 
-        check("db_connection", test_db_connection)
-        check("plain_db_connection", test_plain_db_connection)
-        check("db_tables_exist", test_db_tables_exist)
-        check("embeddings", test_embeddings)
+    def test_store_dedup(self, maasv_db):
+        from maasv.core.store import store_memory
+        mid1 = store_memory(content="Adam lives on the Upper West Side", category="identity")
+        mid2 = store_memory(content="Adam lives on the Upper West Side", category="identity")
+        assert mid1 == mid2
 
-        print("\n=== store.py tests ===")
+    def test_get_all_active(self, maasv_db):
+        from maasv.core.store import get_all_active
+        active = get_all_active()
+        assert len(active) >= 1
+        assert any("Upper West Side" in m['content'] for m in active)
 
-        def test_store_memory():
-            from maasv.core.store import store_memory
-            mid = store_memory(
-                content="Adam lives on the Upper West Side",
-                category="identity",
-                subject="Adam",
-                source="test",
-            )
-            assert mid.startswith("mem_")
-            return mid
+    def test_get_recent_memories(self, maasv_db):
+        from maasv.core.store import get_recent_memories
+        recent = get_recent_memories(hours=48)
+        assert len(recent) >= 1
 
-        def test_store_dedup():
-            from maasv.core.store import store_memory
-            # Store same content again — should dedup
-            mid1 = store_memory(content="Adam lives on the Upper West Side", category="identity")
-            mid2 = store_memory(content="Adam lives on the Upper West Side", category="identity")
-            assert mid1 == mid2, f"Expected dedup: {mid1} != {mid2}"
+    def test_supersede_memory(self, maasv_db):
+        from maasv.core.store import store_memory, supersede_memory, get_all_active
+        old_id = store_memory(content="Gabby works at BigCorp", category="family", subject="Gabby")
+        new_id = supersede_memory(old_id, "Gabby works at AcmeCo")
+        assert new_id != old_id
+        active = get_all_active()
+        active_ids = {m['id'] for m in active}
+        assert new_id in active_ids
+        assert old_id not in active_ids
 
-        def test_get_all_active():
-            from maasv.core.store import get_all_active
-            active = get_all_active()
-            assert len(active) >= 1
-            assert any("Upper West Side" in m['content'] for m in active)
+    def test_update_metadata(self, maasv_db):
+        from maasv.core.store import store_memory, update_memory_metadata
+        mid = store_memory(content="Test metadata update", category="test", metadata={"key1": "val1"})
+        result = update_memory_metadata(mid, {"key2": "val2"})
+        assert result is True
 
-        def test_get_recent_memories():
-            from maasv.core.store import get_recent_memories
-            # Use a wide window — SQLite CURRENT_TIMESTAMP format doesn't include
-            # timezone offset, so string comparison with isoformat(+00:00) can miss.
-            # This is a pre-existing quirk, not a regression.
-            recent = get_recent_memories(hours=48)
-            assert len(recent) >= 1
+    def test_delete_memory(self, maasv_db):
+        from maasv.core.store import store_memory, delete_memory, get_all_active
+        mid = store_memory(content="This memory will be deleted xyz123", category="test")
+        assert delete_memory(mid) is True
+        active = get_all_active()
+        assert not any(m['id'] == mid for m in active)
 
-        def test_supersede_memory():
-            from maasv.core.store import store_memory, supersede_memory, get_all_active
-            old_id = store_memory(content="Gabby works at BigCorp", category="family", subject="Gabby")
-            new_id = supersede_memory(old_id, "Gabby works at AcmeCo")
-            assert new_id != old_id
-            active = get_all_active()
-            active_ids = {m['id'] for m in active}
-            assert new_id in active_ids
-            assert old_id not in active_ids
 
-        def test_update_metadata():
-            from maasv.core.store import store_memory, update_memory_metadata
-            mid = store_memory(content="Test metadata update", category="test", metadata={"key1": "val1"})
-            result = update_memory_metadata(mid, {"key2": "val2"})
-            assert result is True
+# ============================================================================
+# graph.py tests
+# ============================================================================
 
-        def test_delete_memory():
-            from maasv.core.store import store_memory, delete_memory, get_all_active
-            mid = store_memory(content="This memory will be deleted xyz123", category="test")
-            assert delete_memory(mid) is True
-            active = get_all_active()
-            assert not any(m['id'] == mid for m in active)
+class TestGraph:
+    def test_create_entity(self, maasv_db):
+        from maasv.core.graph import create_entity, get_entity
+        eid = create_entity("Adam", "person")
+        assert eid.startswith("ent_")
+        entity = get_entity(eid)
+        assert entity['name'] == "Adam"
+        assert entity['entity_type'] == "person"
 
-        check("store_memory", test_store_memory)
-        check("store_dedup", test_store_dedup)
-        check("get_all_active", test_get_all_active)
-        check("get_recent_memories", test_get_recent_memories)
-        check("supersede_memory", test_supersede_memory)
-        check("update_metadata", test_update_metadata)
-        check("delete_memory", test_delete_memory)
+    def test_find_entity_by_name(self, maasv_db):
+        from maasv.core.graph import find_entity_by_name
+        entity = find_entity_by_name("Adam")
+        assert entity is not None
+        assert entity['name'] == "Adam"
 
-        print("\n=== graph.py tests ===")
+    def test_find_or_create_entity(self, maasv_db):
+        from maasv.core.graph import find_or_create_entity, get_entity
+        eid1 = find_or_create_entity("Adam", "person")
+        eid2 = find_or_create_entity("Doris", "project")
+        assert eid1 != eid2
+        doris = get_entity(eid2)
+        assert doris['name'] == "Doris"
 
-        def test_create_entity():
-            from maasv.core.graph import create_entity, get_entity
-            eid = create_entity("Adam", "person")
-            assert eid.startswith("ent_")
-            entity = get_entity(eid)
-            assert entity['name'] == "Adam"
-            assert entity['entity_type'] == "person"
+    def test_normalize_entity_name(self, maasv_db):
+        from maasv.core.graph import normalize_entity_name
+        assert normalize_entity_name("React-Native") == normalize_entity_name("react_native")
+        assert normalize_entity_name("fastapi.dev") == "fastapi"
+        assert normalize_entity_name("projects") == "project"
 
-        def test_find_entity_by_name():
-            from maasv.core.graph import find_entity_by_name
-            entity = find_entity_by_name("Adam")
-            assert entity is not None
-            assert entity['name'] == "Adam"
+    def test_add_relationship(self, maasv_db):
+        from maasv.core.graph import find_or_create_entity, add_relationship, get_entity_relationships
+        adam_id = find_or_create_entity("Adam", "person")
+        doris_id = find_or_create_entity("Doris", "project")
+        rel_id = add_relationship(adam_id, "works_on", object_id=doris_id, source="test")
+        assert rel_id.startswith("rel_")
+        rels = get_entity_relationships(adam_id, direction="outgoing")
+        assert any(r['predicate'] == "works_on" for r in rels)
 
-        def test_find_or_create_entity():
-            from maasv.core.graph import find_or_create_entity, get_entity
-            # Should find existing "Adam"
-            eid1 = find_or_create_entity("Adam", "person")
-            # Should create new
-            eid2 = find_or_create_entity("Doris", "project")
-            assert eid1 != eid2
-            doris = get_entity(eid2)
-            assert doris['name'] == "Doris"
+    def test_relationship_dedup(self, maasv_db):
+        from maasv.core.graph import find_or_create_entity, add_relationship
+        adam_id = find_or_create_entity("Adam", "person")
+        doris_id = find_or_create_entity("Doris", "project")
+        rel1 = add_relationship(adam_id, "works_on", object_id=doris_id)
+        rel2 = add_relationship(adam_id, "works_on", object_id=doris_id)
+        assert rel1 == rel2
 
-        def test_normalize_entity_name():
-            from maasv.core.graph import normalize_entity_name
-            assert normalize_entity_name("React-Native") == normalize_entity_name("react_native")
-            assert normalize_entity_name("fastapi.dev") == "fastapi"
-            assert normalize_entity_name("projects") == "project"
+    def test_expire_relationship(self, maasv_db):
+        from maasv.core.graph import find_or_create_entity, add_relationship, expire_relationship, get_entity_relationships
+        a_id = find_or_create_entity("TestExpireA", "thing")
+        b_id = find_or_create_entity("TestExpireB", "thing")
+        rel_id = add_relationship(a_id, "test_rel", object_id=b_id)
+        assert expire_relationship(rel_id) is True
+        rels = get_entity_relationships(a_id, include_expired=False)
+        assert not any(r['id'] == rel_id for r in rels)
 
-        def test_add_relationship():
-            from maasv.core.graph import find_or_create_entity, add_relationship, get_entity_relationships
-            adam_id = find_or_create_entity("Adam", "person")
-            doris_id = find_or_create_entity("Doris", "project")
-            rel_id = add_relationship(adam_id, "works_on", object_id=doris_id, source="test")
-            assert rel_id.startswith("rel_")
-            rels = get_entity_relationships(adam_id, direction="outgoing")
-            assert any(r['predicate'] == "works_on" for r in rels)
+    def test_graph_query(self, maasv_db):
+        from maasv.core.graph import graph_query
+        results = graph_query(subject_type="person", predicate="works_on")
+        assert len(results) >= 1
+        assert results[0]['subject_name'] == "Adam"
 
-        def test_relationship_dedup():
-            from maasv.core.graph import find_or_create_entity, add_relationship
-            adam_id = find_or_create_entity("Adam", "person")
-            doris_id = find_or_create_entity("Doris", "project")
-            rel1 = add_relationship(adam_id, "works_on", object_id=doris_id)
-            rel2 = add_relationship(adam_id, "works_on", object_id=doris_id)
-            assert rel1 == rel2, "Duplicate relationship should return same ID"
+    def test_entity_profile(self, maasv_db):
+        from maasv.core.graph import find_entity_by_name, get_entity_profile
+        adam = find_entity_by_name("Adam")
+        profile = get_entity_profile(adam['id'])
+        assert 'entity' in profile
+        assert 'relationships' in profile
+        assert profile['entity']['name'] == "Adam"
 
-        def test_expire_relationship():
-            from maasv.core.graph import find_or_create_entity, add_relationship, expire_relationship, get_entity_relationships
-            a_id = find_or_create_entity("TestExpireA", "thing")
-            b_id = find_or_create_entity("TestExpireB", "thing")
-            rel_id = add_relationship(a_id, "test_rel", object_id=b_id)
-            assert expire_relationship(rel_id) is True
-            rels = get_entity_relationships(a_id, include_expired=False)
-            assert not any(r['id'] == rel_id for r in rels)
+    def test_search_entities(self, maasv_db):
+        from maasv.core.graph import search_entities
+        results = search_entities("Adam")
+        assert len(results) >= 1
 
-        def test_graph_query():
-            from maasv.core.graph import graph_query
-            results = graph_query(subject_type="person", predicate="works_on")
-            assert len(results) >= 1
-            assert results[0]['subject_name'] == "Adam"
+    def test_merge_entity(self, maasv_db):
+        from maasv.core.graph import create_entity, merge_entity, add_relationship, get_entity
+        keeper = create_entity("MergeKeeper", "thing")
+        dup = create_entity("MergeDup", "thing")
+        add_relationship(dup, "test_pred", object_value="test_val")
+        stats = merge_entity(keeper, [dup])
+        assert stats['entities_deleted'] == 1
+        assert get_entity(dup) is None
 
-        def test_entity_profile():
-            from maasv.core.graph import find_entity_by_name, get_entity_profile
-            adam = find_entity_by_name("Adam")
-            profile = get_entity_profile(adam['id'])
-            assert 'entity' in profile
-            assert 'relationships' in profile
-            assert profile['entity']['name'] == "Adam"
 
-        def test_search_entities():
-            from maasv.core.graph import search_entities
-            results = search_entities("Adam")
-            assert len(results) >= 1
+# ============================================================================
+# retrieval.py tests
+# ============================================================================
 
-        def test_merge_entity():
-            from maasv.core.graph import create_entity, merge_entity, add_relationship, get_entity
-            keeper = create_entity("MergeKeeper", "thing")
-            dup = create_entity("MergeDup", "thing")
-            add_relationship(dup, "test_pred", object_value="test_val")
-            stats = merge_entity(keeper, [dup])
-            assert stats['entities_deleted'] == 1
-            assert get_entity(dup) is None
+class TestRetrieval:
+    def test_find_similar_memories(self, maasv_db):
+        from maasv.core.retrieval import find_similar_memories
+        results = find_similar_memories("Adam Upper West Side", limit=3)
+        assert len(results) >= 1
+        assert any("Upper West Side" in m['content'] for m in results)
 
-        check("create_entity", test_create_entity)
-        check("find_entity_by_name", test_find_entity_by_name)
-        check("find_or_create_entity", test_find_or_create_entity)
-        check("normalize_entity_name", test_normalize_entity_name)
-        check("add_relationship", test_add_relationship)
-        check("relationship_dedup", test_relationship_dedup)
-        check("expire_relationship", test_expire_relationship)
-        check("graph_query", test_graph_query)
-        check("entity_profile", test_entity_profile)
-        check("search_entities", test_search_entities)
-        check("merge_entity", test_merge_entity)
+    def test_search_fts(self, maasv_db):
+        from maasv.core.retrieval import search_fts
+        results = search_fts("Upper West Side", limit=5)
+        assert len(results) >= 1
 
-        print("\n=== retrieval.py tests ===")
+    def test_find_by_subject(self, maasv_db):
+        from maasv.core.retrieval import find_by_subject
+        results = find_by_subject("Adam")
+        assert len(results) >= 1
 
-        def test_find_similar_memories():
-            from maasv.core.retrieval import find_similar_memories
-            results = find_similar_memories("Adam Upper West Side", limit=3)
-            assert len(results) >= 1
-            assert any("Upper West Side" in m['content'] for m in results)
+    def test_get_core_memories(self, maasv_db):
+        from maasv.core.retrieval import get_core_memories
+        core = get_core_memories(refresh=True)
+        assert len(core) >= 1
 
-        def test_search_fts():
-            from maasv.core.retrieval import search_fts
-            results = search_fts("Upper West Side", limit=5)
-            assert len(results) >= 1
+    def test_tiered_memory_context(self, maasv_db):
+        from maasv.core.retrieval import get_tiered_memory_context
+        context = get_tiered_memory_context(query="Adam")
+        assert "Remembered facts:" in context
+        assert len(context) > 20
 
-        def test_find_by_subject():
-            from maasv.core.retrieval import find_by_subject
-            results = find_by_subject("Adam")
-            assert len(results) >= 1
 
-        def test_get_core_memories():
-            from maasv.core.retrieval import get_core_memories
-            # We stored identity memories above
-            core = get_core_memories(refresh=True)
-            assert len(core) >= 1
+# ============================================================================
+# wisdom.py tests
+# ============================================================================
 
-        def test_tiered_memory_context():
-            from maasv.core.retrieval import get_tiered_memory_context
-            context = get_tiered_memory_context(query="Adam")
-            assert "Remembered facts:" in context
-            assert len(context) > 20
+class TestWisdom:
+    def test_wisdom_tables(self, maasv_db):
+        from maasv.core.db import get_db
+        db = get_db()
+        tables = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        table_names = {row['name'] for row in tables}
+        assert 'wisdom' in table_names
+        db.close()
 
-        check("find_similar_memories", test_find_similar_memories)
-        check("search_fts", test_search_fts)
-        check("find_by_subject", test_find_by_subject)
-        check("get_core_memories", test_get_core_memories)
-        check("tiered_memory_context", test_tiered_memory_context)
+    def test_log_reasoning(self, maasv_db):
+        from maasv.core.wisdom import log_reasoning
+        entry_id = log_reasoning(
+            action_type="test_action",
+            reasoning="Testing the wisdom module",
+            action_data={"key": "value"},
+        )
+        assert entry_id is not None
 
-        print("\n=== wisdom.py tests ===")
+    def test_search_wisdom(self, maasv_db):
+        from maasv.core.wisdom import search_wisdom
+        results = search_wisdom("test")
+        assert isinstance(results, list)
 
-        def test_wisdom_tables():
-            from maasv.core.db import get_db
-            db = get_db()
-            tables = db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-            table_names = {row['name'] for row in tables}
-            assert 'wisdom' in table_names, f"'wisdom' not in {sorted(table_names)}"
-            db.close()
 
-        def test_log_reasoning():
-            from maasv.core.wisdom import log_reasoning
-            entry_id = log_reasoning(
-                action_type="test_action",
-                reasoning="Testing the wisdom module",
-                action_data={"key": "value"},
-            )
-            assert entry_id is not None
+# ============================================================================
+# __init__.py re-exports
+# ============================================================================
 
-        def test_search_wisdom():
-            from maasv.core.wisdom import search_wisdom
-            results = search_wisdom("test")
-            assert isinstance(results, list)
+class TestReexports:
+    def test_core_reexports(self, maasv_db):
+        from maasv.core import (
+            store_memory, find_similar_memories, find_by_subject, search_fts,
+            get_all_active, get_recent_memories, delete_memory, supersede_memory,
+            create_entity, get_entity, find_entity_by_name, find_or_create_entity,
+            search_entities, add_relationship, expire_relationship,
+            get_entity_relationships, get_causal_chain, graph_query, get_entity_profile,
+            log_reasoning, record_outcome, add_feedback, get_relevant_wisdom, search_wisdom,
+        )
+        assert callable(store_memory)
+        assert callable(find_similar_memories)
+        assert callable(create_entity)
+        assert callable(graph_query)
+        assert callable(log_reasoning)
 
-        check("wisdom_tables", test_wisdom_tables)
-        check("log_reasoning", test_log_reasoning)
-        check("search_wisdom", test_search_wisdom)
 
-        print("\n=== __init__.py re-exports ===")
+# ============================================================================
+# lifecycle import paths
+# ============================================================================
 
-        def test_reexports():
-            from maasv.core import (
-                store_memory, find_similar_memories, find_by_subject, search_fts,
-                get_all_active, get_recent_memories, delete_memory, supersede_memory,
-                create_entity, get_entity, find_entity_by_name, find_or_create_entity,
-                search_entities, add_relationship, expire_relationship,
-                get_entity_relationships, get_causal_chain, graph_query, get_entity_profile,
-                log_reasoning, record_outcome, add_feedback, get_relevant_wisdom, search_wisdom,
-            )
-            # Verify they're callable
-            assert callable(store_memory)
-            assert callable(find_similar_memories)
-            assert callable(create_entity)
-            assert callable(graph_query)
-            assert callable(log_reasoning)
+class TestLifecycleImports:
+    def test_inference_imports(self, maasv_db):
+        from maasv.lifecycle import inference
 
-        check("core_reexports", test_reexports)
+    def test_memory_hygiene_imports(self, maasv_db):
+        from maasv.lifecycle import memory_hygiene
 
-        print("\n=== lifecycle import paths ===")
+    def test_reorganize_imports(self, maasv_db):
+        from maasv.lifecycle import reorganize
 
-        def test_inference_imports():
-            # Verify inference.py uses graph imports
-            from maasv.lifecycle import inference
-            # Just importing is enough — it would fail on bad import paths
 
-        def test_memory_hygiene_imports():
-            from maasv.lifecycle import memory_hygiene
-
-        def test_reorganize_imports():
-            from maasv.lifecycle import reorganize
-
-        check("inference_imports", test_inference_imports)
-        check("memory_hygiene_imports", test_memory_hygiene_imports)
-        check("reorganize_imports", test_reorganize_imports)
-
-    # Summary
-    total = passed + len(errors)
-    print(f"\n{'='*50}")
-    print(f"Results: {passed}/{total} passed")
-    if errors:
-        print(f"\nFailed tests:")
-        for name, err in errors:
-            print(f"  {name}: {err}")
-        return 1
-    else:
-        print("All tests passed!")
-        return 0
-
+# ============================================================================
+# Backwards-compatible CLI entry point
+# ============================================================================
 
 if __name__ == "__main__":
-    sys.exit(run_tests())
+    sys.exit(pytest.main([__file__, "-v"]))

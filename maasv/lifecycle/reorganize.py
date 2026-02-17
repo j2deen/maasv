@@ -9,7 +9,6 @@ Optimizes the knowledge graph for faster retrieval:
 
 import logging
 import json
-import sqlite3
 from typing import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -19,15 +18,8 @@ logger = logging.getLogger("maasv.lifecycle.reorganize")
 def run_reorganize_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
     """Run a graph reorganization job."""
     mode = data.get("mode", "incremental")
-    focus_entities = data.get("focus_entities", [])
 
     results = {"optimizations": [], "cleaned": 0, "paths_cached": 0}
-
-    if cancel_check():
-        return {**results, "cancelled": True}
-
-    _update_access_stats(focus_entities)
-    results["optimizations"].append("updated_access_stats")
 
     if cancel_check():
         return {**results, "cancelled": True}
@@ -45,28 +37,6 @@ def run_reorganize_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
         results["optimizations"].append("cleaned_orphans")
 
     return results
-
-
-def _update_access_stats(focus_entities: list[str] = None):
-    """Update access statistics for entities."""
-    from maasv.core.db import get_db
-
-    db = get_db()
-    try:
-        try:
-            db.execute("ALTER TABLE entities ADD COLUMN access_count INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        try:
-            db.execute("ALTER TABLE entities ADD COLUMN last_accessed_at TEXT")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        db.commit()
-        logger.debug("[Reorganize] Updated access stats schema")
-    except Exception as e:
-        logger.warning(f"[Reorganize] Failed to update access stats: {e}")
-    finally:
-        db.close()
 
 
 def _cache_common_paths() -> int:
@@ -158,40 +128,13 @@ def _store_cached_path(path_name: str, relationships: list[dict]):
         db.close()
 
 
-def get_cached_path(path_name: str) -> list[dict] | None:
-    """Retrieve a cached path if still valid. Returns None if not cached or expired."""
-    from maasv.core.db import get_db
-
-    db = get_db()
-    try:
-        row = db.execute(
-            "SELECT data, expires_at FROM cached_paths WHERE name = ?",
-            (path_name,)
-        ).fetchone()
-
-        if not row:
-            return None
-
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        if datetime.now(timezone.utc) > expires_at:
-            return None
-
-        return json.loads(row["data"])
-
-    except Exception as e:
-        logger.warning(f"[Reorganize] Failed to get cached path '{path_name}': {e}")
-        return None
-    finally:
-        db.close()
-
-
 def _cleanup_orphans() -> int:
     """Clean up orphaned entities (no relationships, created >7 days ago)."""
     from maasv.core.db import get_db
 
     db = get_db()
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
         orphans = db.execute("""
             SELECT e.id FROM entities e

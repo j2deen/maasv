@@ -18,6 +18,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -30,11 +31,17 @@ reranking = [
     "sentence-transformers>=2.0.0",
     # NOTE: pulls in torch (~2GB). Only needed if cross_encoder_enabled=True.
 ]
+dev = [
+    "pytest>=8.0",
+]
 
 [project.urls]
 Homepage = "https://maasv.com"
-Repository = "https://github.com/TODO/maasv"
+Repository = "https://github.com/ascottbell/maasv"
 
 [tool.setuptools.packages.find]
 include = ["maasv*"]
 exclude = ["scripts*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

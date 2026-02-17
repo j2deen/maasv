@@ -894,32 +894,38 @@ def get_tiered_memory_context(
 
 def search_fts(query: str, limit: int = 10, category: Optional[str] = None) -> list[dict]:
     """Full-text search across memories, optionally filtered by category."""
+    import sqlite3
+
     with _db() as db:
-        if category:
-            rows = db.execute("""
-                SELECT
-                    m.id, m.content, m.category, m.subject,
-                    m.confidence, m.created_at
-                FROM memories_fts f
-                JOIN memories m ON f.rowid = m.rowid
-                WHERE memories_fts MATCH ?
-                AND m.superseded_by IS NULL
-                AND m.category = ?
-                ORDER BY rank
-                LIMIT ?
-            """, (query, category, limit)).fetchall()
-        else:
-            rows = db.execute("""
-                SELECT
-                    m.id, m.content, m.category, m.subject,
-                    m.confidence, m.created_at
-                FROM memories_fts f
-                JOIN memories m ON f.rowid = m.rowid
-                WHERE memories_fts MATCH ?
-                AND m.superseded_by IS NULL
-                ORDER BY rank
-                LIMIT ?
-            """, (query, limit)).fetchall()
+        try:
+            if category:
+                rows = db.execute("""
+                    SELECT
+                        m.id, m.content, m.category, m.subject,
+                        m.confidence, m.created_at
+                    FROM memories_fts f
+                    JOIN memories m ON f.rowid = m.rowid
+                    WHERE memories_fts MATCH ?
+                    AND m.superseded_by IS NULL
+                    AND m.category = ?
+                    ORDER BY rank
+                    LIMIT ?
+                """, (query, category, limit)).fetchall()
+            else:
+                rows = db.execute("""
+                    SELECT
+                        m.id, m.content, m.category, m.subject,
+                        m.confidence, m.created_at
+                    FROM memories_fts f
+                    JOIN memories m ON f.rowid = m.rowid
+                    WHERE memories_fts MATCH ?
+                    AND m.superseded_by IS NULL
+                    ORDER BY rank
+                    LIMIT ?
+                """, (query, limit)).fetchall()
+        except sqlite3.OperationalError:
+            logger.debug("FTS5 query failed (bad syntax?): %s", query, exc_info=True)
+            return []
 
     return [dict(row) for row in rows]
 
