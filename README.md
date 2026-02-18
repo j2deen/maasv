@@ -1,20 +1,14 @@
 # maasv
 
-**The cognition layer for AI agents.**
+**A cognition layer for AI agents.**
 
-Your AI remembers things now. It knows your name, your preferences, bits and pieces from past conversations. That's table stakes. But it doesn't *think* about what it knows. It doesn't connect dots across sources, notice patterns over time, or learn from what worked and what didn't. It remembers what you said. maasv understands what you meant.
+maasv gives your agent a real memory — not just storage and retrieval, but a full lifecycle that extracts, structures, connects, consolidates, and prunes knowledge over time. Entities and relationships are pulled from conversations, organized into a knowledge graph, and actively maintained in the background. What comes back out when you query isn't just relevant documents — it's structured understanding with context.
 
-maasv is the layer that closes that gap. Cognition for AI agents. Not just storage and retrieval. A full lifecycle that extracts, structures, connects, consolidates, and prunes knowledge over time.
+## What it does
 
-## What changes
+Your agent remembers that the person you're meeting tomorrow was mentioned in a conversation three weeks ago, and surfaces the context before you ask. It connects a complaint from a customer in March to a feature request from their team in June. It knows you tried a particular approach before and it didn't work, so it suggests something different this time.
 
-Without maasv, your agent answers questions. With it, your agent *notices things*.
-
-It remembers that the person you're meeting tomorrow was mentioned in a conversation three weeks ago, and surfaces the context before you ask. It connects a complaint from a customer in March to a feature request from their team in June. It knows you tried a particular approach before and it didn't work, so it suggests something different this time.
-
-This isn't retrieval-augmented generation. RAG finds documents. maasv builds understanding. A living knowledge graph that grows, consolidates, and prunes itself over time. Data comes in from disparate sources, gets structured into entities and relationships, and what comes back out isn't just information. It's insight.
-
-Your agent doesn't just have access to what it's been told. It has *perspective*.
+The knowledge graph grows, consolidates, and prunes itself over time. Data comes in from disparate sources, gets structured into entities and relationships, and the connections between them become queryable. Your agent builds perspective across conversations, not just within them.
 
 ## Where this came from
 
@@ -30,7 +24,7 @@ Most memory tools store and retrieve. That's two steps. maasv owns six:
 
 **Extract.** Entities, relationships, and facts are pulled from conversations by your LLM. People, places, projects, technologies, and how they connect to each other. Not keywords. Structure.
 
-**Store.** Memories are embedded, categorized, and deduplicated on the way in. Each one carries metadata: confidence, importance, subject, access history. Not a vector dump.
+**Store.** Memories are embedded, categorized, and deduplicated on the way in. Each one carries metadata: confidence, importance, subject, and access history.
 
 **Consolidate.** During idle time, maasv merges near-duplicates, clusters related memories, resolves vague references to specific entities, and pre-computes common graph paths. Your agent's understanding gets sharper while nobody's using it.
 
@@ -38,7 +32,7 @@ Most memory tools store and retrieve. That's two steps. maasv owns six:
 
 **Decay.** Memories that stop being accessed lose confidence over time. Protected categories (identity, family, core preferences) are exempt. Everything else has to earn its place.
 
-**Forget.** Stale, low-confidence memories are pruned. Orphaned entities are cleaned up. The knowledge graph stays lean. This is the part most memory systems skip, and it's why most memory systems get worse over time instead of better.
+**Forget.** Stale, low-confidence memories are pruned. Orphaned entities are cleaned up. The knowledge graph stays lean. Without active forgetting, memory systems tend to get noisier over time — maasv gets sharper.
 
 ## Install
 
