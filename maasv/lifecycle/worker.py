@@ -21,6 +21,7 @@ class JobType(Enum):
     REVIEW = "review"
     REORGANIZE = "reorganize"
     MEMORY_HYGIENE = "memory_hygiene"
+    LEARN = "learn"
 
 
 @dataclass
@@ -47,12 +48,15 @@ class SleepWorker:
         """Lazily start the worker thread on first job."""
         if self._started:
             return
-        self._started = True
-        self._running = True
-        self._cancelled.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="sleep-worker")
-        self._thread.start()
-        logger.info("[Sleep] Worker thread started")
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._running = True
+            self._cancelled.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True, name="sleep-worker")
+            self._thread.start()
+            logger.info("[Sleep] Worker thread started")
 
     def stop(self):
         """Stop the worker thread."""
@@ -140,6 +144,9 @@ class SleepWorker:
             elif job.job_type == JobType.MEMORY_HYGIENE:
                 from maasv.lifecycle.memory_hygiene import run_memory_hygiene_job
                 run_memory_hygiene_job(job.data, cancel_check=self.is_cancelled)
+            elif job.job_type == JobType.LEARN:
+                from maasv.lifecycle.learn import run_learn_job
+                run_learn_job(job.data, cancel_check=self.is_cancelled)
 
             elapsed = time.time() - start
             logger.info(f"[Sleep] Completed {job.job_type.value} job in {elapsed:.1f}s")
@@ -166,6 +173,7 @@ def get_sleep_worker() -> SleepWorker:
 # Idle monitoring
 _idle_monitor_thread: Optional[threading.Thread] = None
 _idle_monitor_running = False
+_idle_monitor_lock = threading.Lock()
 
 # Default thresholds — overridden from config at runtime
 _IDLE_THRESHOLD = 30
@@ -180,51 +188,53 @@ def start_idle_monitor(
     """Start the idle monitor thread."""
     global _idle_monitor_thread, _idle_monitor_running, _IDLE_THRESHOLD, _IDLE_CHECK_INTERVAL
 
-    if _idle_monitor_running:
-        return
+    with _idle_monitor_lock:
+        if _idle_monitor_running:
+            return
 
-    # Read thresholds from config if initialized
-    try:
-        import maasv
-        config = maasv.get_config()
-        _IDLE_THRESHOLD = config.idle_threshold_seconds
-        _IDLE_CHECK_INTERVAL = config.idle_check_interval
-    except RuntimeError:
-        pass
+        # Read thresholds from config if initialized
+        try:
+            import maasv
+            config = maasv.get_config()
+            _IDLE_THRESHOLD = config.idle_threshold_seconds
+            _IDLE_CHECK_INTERVAL = config.idle_check_interval
+        except RuntimeError:
+            pass
 
-    _idle_monitor_running = True
+        _idle_monitor_running = True
 
-    def monitor_loop():
-        was_idle = False
-        while _idle_monitor_running:
-            try:
-                time.sleep(_IDLE_CHECK_INTERVAL)
-                if not _idle_monitor_running:
-                    break
+        def monitor_loop():
+            was_idle = False
+            while _idle_monitor_running:
+                try:
+                    time.sleep(_IDLE_CHECK_INTERVAL)
+                    if not _idle_monitor_running:
+                        break
 
-                last_activity = get_last_activity()
-                idle_duration = time.time() - last_activity
-                is_idle = idle_duration >= _IDLE_THRESHOLD
+                    last_activity = get_last_activity()
+                    idle_duration = time.time() - last_activity
+                    is_idle = idle_duration >= _IDLE_THRESHOLD
 
-                if is_idle and not was_idle:
-                    logger.info(f"[Sleep] Session idle for {idle_duration:.0f}s, starting sleep work")
-                    on_idle()
-                elif not is_idle and was_idle:
-                    logger.info("[Sleep] Session active, cancelling sleep work")
-                    on_active()
+                    if is_idle and not was_idle:
+                        logger.info(f"[Sleep] Session idle for {idle_duration:.0f}s, starting sleep work")
+                        on_idle()
+                    elif not is_idle and was_idle:
+                        logger.info("[Sleep] Session active, cancelling sleep work")
+                        on_active()
 
-                was_idle = is_idle
+                    was_idle = is_idle
 
-            except Exception as e:
-                logger.error(f"[Sleep] Monitor error: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"[Sleep] Monitor error: {e}", exc_info=True)
 
-    _idle_monitor_thread = threading.Thread(target=monitor_loop, daemon=True, name="idle-monitor")
-    _idle_monitor_thread.start()
-    logger.info("[Sleep] Idle monitor started")
+        _idle_monitor_thread = threading.Thread(target=monitor_loop, daemon=True, name="idle-monitor")
+        _idle_monitor_thread.start()
+        logger.info("[Sleep] Idle monitor started")
 
 
 def stop_idle_monitor():
     """Stop the idle monitor thread."""
     global _idle_monitor_running
-    _idle_monitor_running = False
+    with _idle_monitor_lock:
+        _idle_monitor_running = False
     logger.info("[Sleep] Idle monitor stopped")

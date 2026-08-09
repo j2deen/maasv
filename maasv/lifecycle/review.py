@@ -128,6 +128,12 @@ JSON output:"""
             logger.warning("[Review] Failed to parse response")
             return []
 
+        # Task 2: Cardinality cap
+        MAX_INSIGHTS_PER_REVIEW = 20
+        if len(insights) > MAX_INSIGHTS_PER_REVIEW:
+            logger.warning(f"[Review] Capping insights from {len(insights)} to {MAX_INSIGHTS_PER_REVIEW}")
+            insights = insights[:MAX_INSIGHTS_PER_REVIEW]
+
         logger.info(f"[Review] Extracted {len(insights)} insights")
         return insights
     except Exception as e:
@@ -142,12 +148,14 @@ def _store_insights(insights: list[dict]) -> int:
 
     from maasv.core.store import store_memory
 
+    from maasv.core.graph import _clamp_confidence
+
     stored = 0
     for insight in insights:
         try:
             description = insight.get("insight", "")
             evidence = insight.get("evidence", "")
-            confidence = insight.get("confidence", 0.5)
+            confidence = _clamp_confidence(insight.get("confidence", 0.5))
             insight_type = insight.get("type", "unknown")
 
             if not description or confidence < 0.6:

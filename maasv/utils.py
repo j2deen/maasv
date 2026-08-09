@@ -35,5 +35,5 @@ def parse_llm_json(content: str) -> dict | list | None:
     except (json.JSONDecodeError, IndexError):
         pass
 
-    logger.warning("Failed to parse LLM JSON: %s", content[:200])
+    logger.debug("Failed to parse LLM JSON: %s", content[:100])
     return None

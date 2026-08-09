@@ -11,13 +11,16 @@ All operations are audited and can be run in dry-run mode.
 
 import logging
 import json
-import shutil
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from pathlib import Path
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("maasv.lifecycle.memory_hygiene")
+
+# Hard cap on memories loaded into hygiene jobs to bound memory usage.
+# At 10K memories with 1024-dim embeddings, pre-loaded embeddings ≈ 40MB.
+MAX_HYGIENE_MEMORIES = 10_000
 
 
 @dataclass
@@ -160,7 +163,12 @@ def run_memory_hygiene_job(data: dict, cancel_check: Callable[[], bool]) -> dict
 
 
 def _create_backup() -> Optional[Path]:
-    """Create a backup of the database before modifications, retaining only the last N."""
+    """Create a backup of the database before modifications, retaining only the last N.
+
+    Uses sqlite3 Connection.backup() for a consistent snapshot even under
+    concurrent writes (safe with WAL mode), instead of filesystem copy.
+    """
+    import sqlite3
     import maasv
 
     config = maasv.get_config()
@@ -170,11 +178,32 @@ def _create_backup() -> Optional[Path]:
         return None
 
     try:
+        import os
+
         backup_dir = config.backup_dir / "memory_hygiene"
         backup_dir.mkdir(parents=True, exist_ok=True)
+        # Restrict backup directory permissions (owner only)
+        try:
+            os.chmod(backup_dir, 0o700)
+        except OSError:
+            pass
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_path = backup_dir / f"pre_hygiene_{timestamp}.db"
-        shutil.copy2(config.db_path, backup_path)
+
+        src = sqlite3.connect(str(config.db_path))
+        dst = sqlite3.connect(str(backup_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+        # Restrict backup file permissions (owner read/write only)
+        try:
+            os.chmod(backup_path, 0o600)
+        except OSError:
+            pass
 
         # Enforce retention: keep only the last N backups
         _enforce_backup_retention(backup_dir, config.max_hygiene_backups)
@@ -195,8 +224,11 @@ def _enforce_backup_retention(backup_dir: Path, max_backups: int):
         )
 
         for old_backup in backups[max_backups:]:
-            old_backup.unlink()
-            logger.info(f"[MemoryHygiene] Removed old backup: {old_backup.name}")
+            try:
+                old_backup.unlink()
+                logger.info(f"[MemoryHygiene] Removed old backup: {old_backup.name}")
+            except FileNotFoundError:
+                pass  # Already deleted by another process/thread
 
     except Exception as e:
         logger.warning(f"[MemoryHygiene] Backup retention cleanup failed: {e}")
@@ -261,14 +293,15 @@ def _deduplicate_memories(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     db = get_db()
 
     try:
-        # Get all active memories (no category grouping — cross-category dedup)
+        # Get active memories, capped to bound memory usage
         memories = db.execute("""
             SELECT id, content, category, subject, confidence, metadata,
                    created_at, importance, access_count
             FROM memories
             WHERE superseded_by IS NULL
             ORDER BY created_at DESC
-        """).fetchall()
+            LIMIT ?
+        """, (MAX_HYGIENE_MEMORIES,)).fetchall()
 
         memories = [dict(m) for m in memories]
         mem_by_id = {m["id"]: m for m in memories}
@@ -710,7 +743,7 @@ def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> di
     db = get_db()
 
     try:
-        # Get memories grouped by subject (only those with subjects)
+        # Get memories grouped by subject (only those with subjects), capped
         memories = db.execute("""
             SELECT id, content, category, subject, confidence, metadata, created_at
             FROM memories
@@ -718,7 +751,8 @@ def _consolidate_clusters(dry_run: bool, cancel_check: Callable[[], bool]) -> di
             AND subject IS NOT NULL
             AND subject != ''
             ORDER BY subject, created_at DESC
-        """).fetchall()
+            LIMIT ?
+        """, (MAX_HYGIENE_MEMORIES,)).fetchall()
 
         memories = [dict(m) for m in memories]
 

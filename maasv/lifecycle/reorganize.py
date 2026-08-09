@@ -129,31 +129,32 @@ def _store_cached_path(path_name: str, relationships: list[dict]):
 
 
 def _cleanup_orphans() -> int:
-    """Clean up orphaned entities (no relationships, created >7 days ago)."""
+    """Clean up orphaned entities (no relationships, created >7 days ago).
+
+    Uses a single atomic DELETE ... WHERE NOT EXISTS to avoid TOCTOU races
+    between the SELECT and DELETE.
+    """
     from maasv.core.db import get_db
 
     db = get_db()
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
-        orphans = db.execute("""
-            SELECT e.id FROM entities e
-            WHERE e.created_at < ?
+        cursor = db.execute("""
+            DELETE FROM entities
+            WHERE created_at < ?
             AND NOT EXISTS (
                 SELECT 1 FROM relationships r
-                WHERE r.subject_id = e.id OR r.object_id = e.id
+                WHERE r.subject_id = entities.id OR r.object_id = entities.id
             )
-        """, (cutoff,)).fetchall()
+        """, (cutoff,))
+        deleted = cursor.rowcount
+        db.commit()
 
-        orphan_ids = [row["id"] for row in orphans]
+        if deleted:
+            logger.info(f"[Reorganize] Cleaned {deleted} orphaned entities")
 
-        if orphan_ids:
-            placeholders = ",".join("?" * len(orphan_ids))
-            db.execute(f"DELETE FROM entities WHERE id IN ({placeholders})", orphan_ids)
-            db.commit()
-            logger.info(f"[Reorganize] Cleaned {len(orphan_ids)} orphaned entities")
-
-        return len(orphan_ids)
+        return deleted
 
     except Exception as e:
         logger.warning(f"[Reorganize] Failed to cleanup orphans: {e}")

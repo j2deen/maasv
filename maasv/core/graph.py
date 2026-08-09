@@ -8,6 +8,7 @@ All graph memory operations live here.
 import logging
 import re
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,6 +16,63 @@ from typing import Optional
 from maasv.core.db import _db, _record_entity_access, _escape_like
 
 logger = logging.getLogger(__name__)
+
+# Entity name character allowlist: alphanumeric, spaces, hyphens, underscores, periods, apostrophes
+_ENTITY_NAME_RE = re.compile(r"[^a-zA-Z0-9 \-_.']+")
+MAX_ENTITY_NAME_LENGTH = 200
+MAX_OBJECT_VALUE_LENGTH = 2000
+
+# Valid predicates — union of all predicates used across the codebase
+VALID_PREDICATES = {
+    # Location
+    "located_in", "lives_in", "visited", "located_at",
+    # Projects
+    "works_on", "manages", "created", "owns",
+    # Organization
+    "works_at",
+    # Technology
+    "uses_tech", "built_with", "runs_on", "hosted_on", "depends_on", "written_in",
+    # Family / social
+    "parent_of", "child_of", "married_to", "sibling_of", "friend_of",
+    "works_with", "colleague_of", "spouse", "child", "sibling",
+    # Attributes
+    "has_email", "has_phone", "has_birthday", "has_age",
+    # Causal
+    "caused_by", "led_to", "resulted_in", "motivated_by",
+    "enabled_by", "blocked_by", "chose_over",
+    # Inference
+    "has_reference", "inferred_as",
+    # Integration / usage
+    "integrates_with", "integrated_via", "used_for", "uses",
+    "monitors", "integrates",
+    # Ownership / property
+    "owns_pet", "has_property_in",
+    # Social
+    "interested_in", "collaborates_with",
+}
+
+
+def _sanitize_entity_name(name: str) -> str:
+    """Sanitize entity name to allowed characters only.
+
+    Strips characters not in [a-zA-Z0-9 \\-_.']. Collapses whitespace.
+    Truncates to MAX_ENTITY_NAME_LENGTH.
+    Raises ValueError if result is empty or single-character.
+    """
+    sanitized = _ENTITY_NAME_RE.sub("", name).strip()
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    if len(sanitized) < 2:
+        raise ValueError(f"Entity name too short after sanitization: {name!r} -> {sanitized!r}")
+    return sanitized[:MAX_ENTITY_NAME_LENGTH]
+
+
+def _clamp_confidence(value, default: float = 0.5) -> float:
+    """Clamp confidence to [0.0, 1.0]. Coerce non-numeric to default."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, result))
 
 
 # ============================================================================
@@ -27,21 +85,36 @@ def create_entity(
     canonical_name: Optional[str] = None,
     metadata: Optional[dict] = None
 ) -> str:
-    """Create a new entity in the knowledge graph."""
+    """Create a new entity in the knowledge graph.
+
+    If an entity with the same (canonical_name, entity_type) already exists
+    (race condition with find_or_create_entity), returns the existing entity's ID.
+    """
+    name = _sanitize_entity_name(name)
     entity_id = f"ent_{uuid.uuid4().hex[:12]}"
 
     if canonical_name is None:
         canonical_name = name.lower().strip().replace(" ", "_")
 
     with _db() as db:
-        db.execute("""
-            INSERT INTO entities (id, name, entity_type, canonical_name, metadata)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            entity_id, name, entity_type, canonical_name,
-            json.dumps(metadata) if metadata else None
-        ))
-        db.commit()
+        try:
+            db.execute("""
+                INSERT INTO entities (id, name, entity_type, canonical_name, metadata)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                entity_id, name, entity_type, canonical_name,
+                json.dumps(metadata) if metadata else None
+            ))
+            db.commit()
+        except sqlite3.IntegrityError:
+            # Unique constraint on (canonical_name, entity_type) — return existing
+            row = db.execute(
+                "SELECT id FROM entities WHERE canonical_name = ? AND entity_type = ?",
+                (canonical_name, entity_type)
+            ).fetchone()
+            if row:
+                return row["id"]
+            raise  # Different constraint violation, re-raise
     return entity_id
 
 
@@ -126,6 +199,8 @@ def find_or_create_entity(
     2. Normalized name match within same entity_type (prevents near-duplicates
        like "react-native" when "react_native" already exists)
     """
+    name = _sanitize_entity_name(name)
+
     # 1. Exact match (any type)
     existing = find_entity_by_name(name)
     if existing:
@@ -268,8 +343,31 @@ def search_entities(
     entity_type: Optional[str] = None,
     limit: int = 10
 ) -> list[dict]:
-    """Search entities using FTS."""
+    """Search entities using tiered FTS: word-match → trigram substring → LIKE fallback.
+
+    1. Word-match FTS5 (entities_fts): best for multi-word names ("Adam Epstein")
+    2. Trigram FTS5 (entities_trigram): substring matching ("Robot" in "MaasvTestRobot")
+       Requires query length >= 3 (trigram minimum)
+    3. LIKE fallback: catches everything else (short queries, FTS errors)
+    """
+    from maasv.core.db import _sanitize_fts_input
+
+    sanitized = _sanitize_fts_input(query)
+    if not sanitized.strip():
+        return []
+
+    def _parse_rows(rows):
+        results = []
+        for row in rows:
+            result = dict(row)
+            if result.get('metadata'):
+                result['metadata'] = json.loads(result['metadata'])
+            results.append(result)
+        return results
+
     with _db() as db:
+        # Tier 1: Word-match FTS5
+        rows = []
         try:
             if entity_type:
                 rows = db.execute("""
@@ -280,7 +378,7 @@ def search_entities(
                     AND e.entity_type = ?
                     ORDER BY rank
                     LIMIT ?
-                """, (query, entity_type, limit)).fetchall()
+                """, (sanitized, entity_type, limit)).fetchall()
             else:
                 rows = db.execute("""
                     SELECT e.*
@@ -289,28 +387,53 @@ def search_entities(
                     WHERE entities_fts MATCH ?
                     ORDER BY rank
                     LIMIT ?
-                """, (query, limit)).fetchall()
+                """, (sanitized, limit)).fetchall()
         except Exception:
-            escaped_query = _escape_like(query)
-            if entity_type:
-                rows = db.execute("""
-                    SELECT * FROM entities
-                    WHERE name LIKE ? ESCAPE '\\' AND entity_type = ?
-                    LIMIT ?
-                """, (f"%{escaped_query}%", entity_type, limit)).fetchall()
-            else:
-                rows = db.execute("""
-                    SELECT * FROM entities WHERE name LIKE ? ESCAPE '\\' LIMIT ?
-                """, (f"%{escaped_query}%", limit)).fetchall()
+            pass  # Fall through to trigram
 
-    results = []
-    for row in rows:
-        result = dict(row)
-        if result.get('metadata'):
-            result['metadata'] = json.loads(result['metadata'])
-        results.append(result)
+        if rows:
+            return _parse_rows(rows)
 
-    return results
+        # Tier 2: Trigram FTS5 (substring matching, requires >= 3 chars)
+        if len(sanitized) >= 3:
+            try:
+                if entity_type:
+                    rows = db.execute("""
+                        SELECT e.*
+                        FROM entities_trigram t
+                        JOIN entities e ON t.rowid = e.rowid
+                        WHERE entities_trigram MATCH ?
+                        AND e.entity_type = ?
+                        LIMIT ?
+                    """, (sanitized, entity_type, limit)).fetchall()
+                else:
+                    rows = db.execute("""
+                        SELECT e.*
+                        FROM entities_trigram t
+                        JOIN entities e ON t.rowid = e.rowid
+                        WHERE entities_trigram MATCH ?
+                        LIMIT ?
+                    """, (sanitized, limit)).fetchall()
+            except Exception:
+                pass  # Fall through to LIKE
+
+            if rows:
+                return _parse_rows(rows)
+
+        # Tier 3: LIKE fallback (short queries or FTS failures)
+        escaped_query = _escape_like(query)
+        if entity_type:
+            rows = db.execute("""
+                SELECT * FROM entities
+                WHERE name LIKE ? ESCAPE '\\' AND entity_type = ?
+                LIMIT ?
+            """, (f"%{escaped_query}%", entity_type, limit)).fetchall()
+        else:
+            rows = db.execute("""
+                SELECT * FROM entities WHERE name LIKE ? ESCAPE '\\' LIMIT ?
+            """, (f"%{escaped_query}%", limit)).fetchall()
+
+    return _parse_rows(rows)
 
 
 def get_entities_by_type(entity_type: str, limit: int = 50) -> list[dict]:
@@ -343,7 +466,9 @@ def add_relationship(
     valid_from: Optional[str] = None,
     confidence: float = 1.0,
     source: Optional[str] = None,
-    metadata: Optional[dict] = None
+    metadata: Optional[dict] = None,
+    origin: Optional[str] = None,
+    origin_interface: Optional[str] = None,
 ) -> str:
     """Add a temporal relationship between entities.
 
@@ -353,6 +478,25 @@ def add_relationship(
     """
     if object_id is None and object_value is None:
         raise ValueError("Must provide either object_id or object_value")
+
+    # Task 5: Predicate allowlist (extended by config.extra_predicates)
+    import maasv
+    allowed = VALID_PREDICATES | maasv.get_config().extra_predicates
+    if predicate not in allowed:
+        raise ValueError(f"Unknown predicate: {predicate!r}")
+
+    # Task 4: Confidence clamping
+    confidence = _clamp_confidence(confidence)
+
+    # Task 3: Object value length cap
+    if object_value is not None:
+        object_value = str(object_value)[:MAX_OBJECT_VALUE_LENGTH]
+
+    # Task 23: Cap metadata JSON size
+    if metadata is not None:
+        meta_json = json.dumps(metadata)
+        if len(meta_json) > 10_000:
+            raise ValueError(f"Relationship metadata JSON exceeds 10K chars ({len(meta_json)})")
 
     if valid_from is None:
         valid_from = datetime.now(timezone.utc).isoformat()
@@ -386,16 +530,37 @@ def add_relationship(
 
         # No existing match — insert new
         rel_id = f"rel_{uuid.uuid4().hex[:12]}"
-        db.execute("""
-            INSERT INTO relationships
-            (id, subject_id, predicate, object_id, object_value, valid_from, confidence, source, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rel_id, subject_id, predicate, object_id, object_value,
-            valid_from, confidence, source,
-            json.dumps(metadata) if metadata else None
-        ))
-        db.commit()
+        try:
+            db.execute("""
+                INSERT INTO relationships
+                (id, subject_id, predicate, object_id, object_value, valid_from, confidence, source, metadata, origin, origin_interface)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                rel_id, subject_id, predicate, object_id, object_value,
+                valid_from, confidence, source,
+                json.dumps(metadata) if metadata else None,
+                origin, origin_interface,
+            ))
+            db.commit()
+        except sqlite3.IntegrityError:
+            # Partial unique index conflict — another thread created the same active relationship
+            if object_id is not None:
+                row = db.execute("""
+                    SELECT id FROM relationships
+                    WHERE subject_id = ? AND predicate = ? AND object_id = ?
+                    AND valid_to IS NULL
+                    LIMIT 1
+                """, (subject_id, predicate, object_id)).fetchone()
+            else:
+                row = db.execute("""
+                    SELECT id FROM relationships
+                    WHERE subject_id = ? AND predicate = ? AND object_value = ?
+                    AND valid_to IS NULL
+                    LIMIT 1
+                """, (subject_id, predicate, object_value)).fetchone()
+            if row:
+                return row["id"]
+            raise  # Different constraint violation, re-raise
     return rel_id
 
 
@@ -570,26 +735,49 @@ def update_relationship_value(
     subject_id: str,
     predicate: str,
     new_value: str,
-    source: Optional[str] = None
+    source: Optional[str] = None,
+    origin: Optional[str] = None,
+    origin_interface: Optional[str] = None,
 ) -> tuple[Optional[str], str]:
-    """Update a relationship by expiring the old one and creating a new one."""
+    """Update a relationship by expiring the old one and creating a new one.
+
+    Uses a single connection/transaction: find current -> expire old -> insert new.
+    """
+    import maasv
+    allowed = VALID_PREDICATES | maasv.get_config().extra_predicates
+    if predicate not in allowed:
+        raise ValueError(f"Unknown predicate: {predicate!r}")
+
+    new_value = str(new_value)[:MAX_OBJECT_VALUE_LENGTH]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     with _db() as db:
+        # 1. Find current active relationship
         current = db.execute("""
             SELECT id FROM relationships
             WHERE subject_id = ? AND predicate = ? AND valid_to IS NULL
         """, (subject_id, predicate)).fetchone()
 
-    old_id = None
-    if current:
-        old_id = current['id']
-        expire_relationship(old_id)
+        old_id = None
+        if current:
+            old_id = current['id']
+            # 2. Expire the old relationship
+            db.execute(
+                "UPDATE relationships SET valid_to = ? WHERE id = ? AND valid_to IS NULL",
+                (now_iso, old_id)
+            )
 
-    new_id = add_relationship(
-        subject_id=subject_id,
-        predicate=predicate,
-        object_value=new_value,
-        source=source
-    )
+        # 3. Insert the new relationship
+        new_id = f"rel_{uuid.uuid4().hex[:12]}"
+        db.execute("""
+            INSERT INTO relationships
+            (id, subject_id, predicate, object_value, valid_from, confidence, source,
+             origin, origin_interface)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (new_id, subject_id, predicate, new_value, now_iso, 1.0, source,
+              origin, origin_interface))
+
+        db.commit()
 
     return (old_id, new_id)
 

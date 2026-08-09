@@ -5,13 +5,22 @@ Connection management, schema initialization, migrations, embedding helpers,
 and access tracking. All other core modules import from here for DB access.
 """
 
+import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_pragmas(db: sqlite3.Connection):
+    """Apply standard SQLite pragmas for safety and concurrency."""
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("PRAGMA foreign_keys=ON")
 
 
 def _get_db_path():
@@ -38,6 +47,7 @@ def get_db() -> sqlite3.Connection:
 
     db = sqlite3.connect(str(_get_db_path()))
     db.row_factory = sqlite3.Row
+    _apply_pragmas(db)
 
     db.enable_load_extension(True)
     sqlite_vec.load(db)
@@ -63,6 +73,7 @@ def get_plain_db() -> sqlite3.Connection:
     """
     db = sqlite3.connect(str(_get_db_path()))
     db.row_factory = sqlite3.Row
+    _apply_pragmas(db)
     return db
 
 
@@ -120,6 +131,62 @@ def run_migration(db: sqlite3.Connection, version: int, description: str, migrat
         db.rollback()
         logger.error(f"Migration {version} failed, rolled back", exc_info=True)
         raise
+
+
+def _verify_embed_model(db: sqlite3.Connection, model: str, dims: int):
+    """Record or verify the embedding model used for this database.
+
+    On first init, writes the model name and dims to db_meta. On subsequent
+    opens, verifies the configured model matches what the DB was built with.
+    Raises on mismatch to prevent silent vector space corruption.
+    """
+    # Check if db_meta table exists (won't exist on very first init before migration 7)
+    table_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='db_meta'"
+    ).fetchone()
+    if not table_exists:
+        return  # Migration hasn't run yet, skip
+
+    existing_model = db.execute(
+        "SELECT value FROM db_meta WHERE key = 'embed_model'"
+    ).fetchone()
+
+    existing_dims = db.execute(
+        "SELECT value FROM db_meta WHERE key = 'embed_dims'"
+    ).fetchone()
+
+    if existing_model is None:
+        # First time — record the model
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        db.execute(
+            "INSERT INTO db_meta (key, value, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("embed_model", model, now, now)
+        )
+        db.execute(
+            "INSERT INTO db_meta (key, value, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("embed_dims", str(dims), now, now)
+        )
+        db.commit()
+        logger.info("Recorded embedding model in db_meta: %s (%dd)", model, dims)
+    else:
+        # Verify match
+        db_model = existing_model["value"]
+        db_dims = int(existing_dims["value"]) if existing_dims else None
+
+        if db_model != model:
+            raise RuntimeError(
+                f"Embedding model mismatch! Database was built with '{db_model}' "
+                f"but current config uses '{model}'. Using different embedding models "
+                f"on the same database corrupts the vector space. Either change your "
+                f"config to match, or create a new database."
+            )
+
+        if db_dims is not None and db_dims != dims:
+            raise RuntimeError(
+                f"Embedding dimension mismatch! Database was built with {db_dims}d "
+                f"but current config uses {dims}d. Either change config.embed_dims "
+                f"to {db_dims} or create a new database."
+            )
 
 
 def init_db():
@@ -308,7 +375,280 @@ def init_db():
 
     run_migration(db, 3, "Entity access tracking columns", _migrate_entity_access)
 
+    # Version 4: Dedup constraints — unique indexes on entities and active relationships
+    def _migrate_dedup_constraints(db: sqlite3.Connection):
+        # --- Clean up existing entity duplicates (same canonical_name + entity_type) ---
+        dup_groups = db.execute("""
+            SELECT canonical_name, entity_type
+            FROM entities
+            GROUP BY canonical_name, entity_type
+            HAVING COUNT(*) > 1
+        """).fetchall()
+
+        for g in dup_groups:
+            rows = db.execute("""
+                SELECT id FROM entities
+                WHERE canonical_name = ? AND entity_type = ?
+                ORDER BY rowid ASC
+            """, (g["canonical_name"], g["entity_type"])).fetchall()
+
+            keeper_id = rows[0]["id"]
+            dup_ids = [r["id"] for r in rows[1:]]
+            if dup_ids:
+                ph = ",".join("?" * len(dup_ids))
+                db.execute(
+                    f"UPDATE relationships SET subject_id = ? WHERE subject_id IN ({ph})",
+                    [keeper_id] + dup_ids
+                )
+                db.execute(
+                    f"UPDATE relationships SET object_id = ? WHERE object_id IN ({ph})",
+                    [keeper_id] + dup_ids
+                )
+                db.execute(f"DELETE FROM entities WHERE id IN ({ph})", dup_ids)
+                logger.info(
+                    f"Migration 4: merged {len(dup_ids)} duplicate entities for "
+                    f"'{g['canonical_name']}' ({g['entity_type']})"
+                )
+
+        # --- Clean up existing active relationship duplicates ---
+        # Entity-to-entity: keep highest confidence per (subject_id, predicate, object_id)
+        rel_groups = db.execute("""
+            SELECT subject_id, predicate, object_id
+            FROM relationships
+            WHERE valid_to IS NULL AND object_id IS NOT NULL
+            GROUP BY subject_id, predicate, object_id
+            HAVING COUNT(*) > 1
+        """).fetchall()
+
+        for g in rel_groups:
+            rows = db.execute("""
+                SELECT id FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND object_id = ?
+                AND valid_to IS NULL
+                ORDER BY confidence DESC, created_at ASC
+            """, (g["subject_id"], g["predicate"], g["object_id"])).fetchall()
+            to_delete = [r["id"] for r in rows[1:]]
+            if to_delete:
+                ph = ",".join("?" * len(to_delete))
+                db.execute(f"DELETE FROM relationships WHERE id IN ({ph})", to_delete)
+
+        # Value-based: keep highest confidence per (subject_id, predicate, object_value)
+        val_groups = db.execute("""
+            SELECT subject_id, predicate, object_value
+            FROM relationships
+            WHERE valid_to IS NULL AND object_id IS NULL AND object_value IS NOT NULL
+            GROUP BY subject_id, predicate, object_value
+            HAVING COUNT(*) > 1
+        """).fetchall()
+
+        for g in val_groups:
+            rows = db.execute("""
+                SELECT id FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND object_value = ?
+                AND valid_to IS NULL AND object_id IS NULL
+                ORDER BY confidence DESC, created_at ASC
+            """, (g["subject_id"], g["predicate"], g["object_value"])).fetchall()
+            to_delete = [r["id"] for r in rows[1:]]
+            if to_delete:
+                ph = ",".join("?" * len(to_delete))
+                db.execute(f"DELETE FROM relationships WHERE id IN ({ph})", to_delete)
+
+        # --- Create unique indexes ---
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_unique_canonical
+            ON entities(canonical_name, entity_type)
+        """)
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_active_entity
+            ON relationships(subject_id, predicate, object_id)
+            WHERE valid_to IS NULL AND object_id IS NOT NULL
+        """)
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_active_value
+            ON relationships(subject_id, predicate, object_value)
+            WHERE valid_to IS NULL AND object_value IS NOT NULL
+        """)
+
+    run_migration(db, 4, "Dedup constraints — unique indexes on entities and active relationships", _migrate_dedup_constraints)
+
+    # --- Migration 5: Learned ranker tables ---
+    def _migrate_learned_ranker(db):
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS retrieval_log (
+                id TEXT PRIMARY KEY,
+                query_text TEXT NOT NULL,
+                query_embedding_hash TEXT,
+                timestamp TEXT NOT NULL,
+                candidate_count INTEGER,
+                returned_ids TEXT NOT NULL,
+                features TEXT NOT NULL,
+                outcomes TEXT,
+                outcome_recorded_at TEXT
+            )
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_retrieval_log_timestamp
+            ON retrieval_log(timestamp)
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_retrieval_log_outcomes
+            ON retrieval_log(outcomes)
+            WHERE outcomes IS NULL
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS learned_ranker_weights (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                weights_json TEXT NOT NULL,
+                feature_names TEXT NOT NULL,
+                trained_at TEXT,
+                training_samples INTEGER,
+                training_loss REAL,
+                ndcg_score REAL,
+                version INTEGER DEFAULT 1
+            )
+        """)
+
+    run_migration(db, 5, "Learned ranker — retrieval_log and weights tables", _migrate_learned_ranker)
+
+    # --- Migration 6: Origin provenance columns ---
+    def _migrate_origin(db: sqlite3.Connection):
+        # Add origin (who/what created it: "claude", "chatgpt", "salesforce")
+        # and origin_interface (specific client: "claude-code", "claude-desktop", "codex")
+        # to both memories and relationships.
+        db.execute("ALTER TABLE memories ADD COLUMN origin TEXT DEFAULT NULL")
+        db.execute("ALTER TABLE memories ADD COLUMN origin_interface TEXT DEFAULT NULL")
+        db.execute("ALTER TABLE relationships ADD COLUMN origin TEXT DEFAULT NULL")
+        db.execute("ALTER TABLE relationships ADD COLUMN origin_interface TEXT DEFAULT NULL")
+
+        # Indexes for filtering by origin (common query pattern for multi-agent)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_memories_origin ON memories(origin)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_memories_origin_interface ON memories(origin_interface)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_relationships_origin ON relationships(origin)")
+
+    run_migration(db, 6, "Origin provenance columns (origin, origin_interface)", _migrate_origin)
+
+    # --- Migration 7: Database metadata table (embedding model tracking) ---
+    def _migrate_db_meta(db: sqlite3.Connection):
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS db_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    run_migration(db, 7, "Database metadata table (db_meta)", _migrate_db_meta)
+
+    # --- Migration 8: Trigram FTS5 table for entity substring search ---
+    def _migrate_entity_trigram(db: sqlite3.Connection):
+        # Second FTS5 table using trigram tokenizer — enables substring matching
+        # on entity names (e.g., "Robot" finds "MaasvTestRobot").
+        # Uses external content table to avoid data duplication.
+        db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS entities_trigram USING fts5(
+                name,
+                canonical_name,
+                content='entities',
+                content_rowid='rowid',
+                tokenize='trigram',
+                detail='none'
+            )
+        """)
+
+        # Sync triggers: insert, delete, update
+        db.execute("""
+            CREATE TRIGGER IF NOT EXISTS entities_trigram_ai AFTER INSERT ON entities BEGIN
+                INSERT INTO entities_trigram(rowid, name, canonical_name)
+                VALUES (NEW.rowid, NEW.name, NEW.canonical_name);
+            END
+        """)
+        db.execute("""
+            CREATE TRIGGER IF NOT EXISTS entities_trigram_ad AFTER DELETE ON entities BEGIN
+                INSERT INTO entities_trigram(entities_trigram, rowid, name, canonical_name)
+                VALUES ('delete', OLD.rowid, OLD.name, OLD.canonical_name);
+            END
+        """)
+        db.execute("""
+            CREATE TRIGGER IF NOT EXISTS entities_trigram_au AFTER UPDATE ON entities BEGIN
+                INSERT INTO entities_trigram(entities_trigram, rowid, name, canonical_name)
+                VALUES ('delete', OLD.rowid, OLD.name, OLD.canonical_name);
+                INSERT INTO entities_trigram(rowid, name, canonical_name)
+                VALUES (NEW.rowid, NEW.name, NEW.canonical_name);
+            END
+        """)
+
+        # Backfill existing entities into trigram index
+        db.execute("""
+            INSERT INTO entities_trigram(rowid, name, canonical_name)
+            SELECT rowid, name, canonical_name FROM entities
+        """)
+
+    run_migration(db, 8, "Trigram FTS5 table for entity substring search", _migrate_entity_trigram)
+
+    # --- Migration 9: Surfacing count for IPS (Inverse Propensity Scoring) ---
+    def _migrate_surfacing_count(db: sqlite3.Connection):
+        db.execute("ALTER TABLE memories ADD COLUMN surfacing_count INTEGER DEFAULT 0")
+
+        # Backfill from retrieval_log: count how many log entries each memory_id
+        # appears in (as a key in the features JSON dict).
+        rows = db.execute("SELECT features FROM retrieval_log WHERE features IS NOT NULL").fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            try:
+                features_dict = json.loads(row["features"])
+                for mem_id in features_dict:
+                    counts[mem_id] = counts.get(mem_id, 0) + 1
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        for mem_id, count in counts.items():
+            db.execute(
+                "UPDATE memories SET surfacing_count = ? WHERE id = ?",
+                (count, mem_id),
+            )
+
+    run_migration(db, 9, "Surfacing count for IPS", _migrate_surfacing_count)
+
+    # --- Migration 10: Shadow metrics table for graduation readiness ---
+    def _migrate_shadow_metrics(db: sqlite3.Connection):
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                top5_overlap INTEGER NOT NULL,
+                kendall_tau REAL NOT NULL,
+                avg_surfacing REAL NOT NULL,
+                candidate_count INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_shadow_metrics_timestamp
+            ON shadow_metrics(timestamp)
+        """)
+
+    run_migration(db, 10, "Shadow metrics table for graduation readiness", _migrate_shadow_metrics)
+
+    # Record / verify embedding model — must happen AFTER migration 7 creates the table
+    import maasv
+    config = maasv.get_config()
+    _verify_embed_model(db, config.embed_model, config.embed_dims)
+
     db.close()
+
+    # Set restrictive file permissions on the database (owner read/write only).
+    # SQLite stores data in plaintext — file permissions are the first line of defense.
+    import os
+    db_path = _get_db_path()
+    try:
+        os.chmod(db_path, 0o600)
+        # WAL and SHM files too, if they exist
+        for suffix in ("-wal", "-shm"):
+            wal_path = str(db_path) + suffix
+            if os.path.exists(wal_path):
+                os.chmod(wal_path, 0o600)
+    except OSError:
+        logger.debug("Could not set restrictive permissions on database files")
 
 
 # ============================================================================
@@ -354,6 +694,26 @@ def _record_memory_access(db: sqlite3.Connection, memory_ids: list[str]):
         logger.warning("Failed to record memory access", exc_info=True)
 
 
+def _record_surfacing(db: sqlite3.Connection, memory_ids: list[str]):
+    """Increment surfacing_count for memories that appeared in a candidate pool.
+
+    Used by the learned ranker to track how often each memory is surfaced,
+    enabling IPS (Inverse Propensity Scoring) to correct position bias.
+    Caller handles commit.
+    """
+    if not memory_ids:
+        return
+    placeholders = ",".join("?" * len(memory_ids))
+    try:
+        db.execute(
+            f"UPDATE memories SET surfacing_count = surfacing_count + 1 "
+            f"WHERE id IN ({placeholders})",
+            memory_ids,
+        )
+    except Exception:
+        logger.warning("Failed to record memory surfacing", exc_info=True)
+
+
 def _record_entity_access(db: sqlite3.Connection, entity_ids: list[str]):
     """Increment access_count and set last_accessed_at for retrieved entities."""
     if not entity_ids:
@@ -374,3 +734,19 @@ def _record_entity_access(db: sqlite3.Connection, entity_ids: list[str]):
 def _escape_like(value: str) -> str:
     """Escape LIKE wildcards (%, _) in a value for safe use in LIKE patterns."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+_FTS5_SPECIAL_RE = re.compile(r'[\"*()^]')
+_FTS5_OPERATOR_RE = re.compile(r'\b(NEAR|NOT)\b', re.IGNORECASE)
+
+
+def _sanitize_fts_input(text: str) -> str:
+    """Strip FTS5 special syntax from raw text for safe use in MATCH queries.
+
+    Removes characters that cause syntax errors (", *, (, ), ^) and operators
+    that can produce unexpected results (NEAR, NOT). Preserves OR/AND since
+    they are harmless (just modify query semantics) and used by callers.
+    """
+    text = _FTS5_SPECIAL_RE.sub(' ', text)
+    text = _FTS5_OPERATOR_RE.sub(' ', text)
+    return ' '.join(text.split())

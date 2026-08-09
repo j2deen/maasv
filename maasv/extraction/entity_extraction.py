@@ -44,6 +44,12 @@ PREDICATE_OBJECT_TYPE = {
 CAUSAL_PREDICATES = {"caused_by", "led_to", "resulted_in", "motivated_by", "enabled_by", "blocked_by", "chose_over"}
 CAUSAL_MIN_CONFIDENCE = 0.8
 
+# Cardinality caps (Task 2)
+MAX_ENTITIES_PER_EXTRACTION = 20
+MAX_RELATIONSHIPS_PER_EXTRACTION = 30
+# Field length caps (Task 3)
+MAX_CONTENT_LENGTH = 10_000
+
 PREDICATE_SUBJECT_TYPE = {
     "located_in": "place",
     "has_email": "person", "has_phone": "person",
@@ -189,6 +195,14 @@ class EntityExtractor:
             entities = data.get("entities", [])
             relationships = data.get("relationships", [])
 
+            # Task 2: Cardinality caps
+            if len(entities) > MAX_ENTITIES_PER_EXTRACTION:
+                logger.warning(f"Capping entities from {len(entities)} to {MAX_ENTITIES_PER_EXTRACTION}")
+                entities = entities[:MAX_ENTITIES_PER_EXTRACTION]
+            if len(relationships) > MAX_RELATIONSHIPS_PER_EXTRACTION:
+                logger.warning(f"Capping relationships from {len(relationships)} to {MAX_RELATIONSHIPS_PER_EXTRACTION}")
+                relationships = relationships[:MAX_RELATIONSHIPS_PER_EXTRACTION]
+
             logger.info(f"Extracted {len(entities)} entities, {len(relationships)} relationships")
 
             return {"entities": entities, "relationships": relationships, "status": "success"}
@@ -212,10 +226,15 @@ class EntityExtractor:
 
         entity_id_map = {}
 
+        from maasv.core.graph import _clamp_confidence, MAX_ENTITY_NAME_LENGTH, VALID_PREDICATES
+
         for entity in extraction_result.get("entities", []):
-            name = entity.get("name", "").strip()
+            name = entity.get("name", "").strip()[:MAX_ENTITY_NAME_LENGTH]
             entity_type = entity.get("type", "concept")
-            confidence = entity.get("confidence", 0.7)
+            confidence = _clamp_confidence(entity.get("confidence", 0.7))
+            description = entity.get("description", "")
+            if isinstance(description, str):
+                description = description[:MAX_CONTENT_LENGTH]
 
             if not name or _is_garbage_entity(name):
                 stats["entities_skipped"] += 1
@@ -235,26 +254,30 @@ class EntityExtractor:
                     name=name,
                     entity_type=entity_type,
                     metadata={
-                        "description": entity.get("description"),
+                        "description": description,
                         "source": "extraction",
                         "confidence": confidence,
                     }
                 )
                 entity_id_map[name] = entity_id
                 stats["entities_created"] += 1
-                logger.info(f"Created entity: {name} ({entity_type})")
+                logger.debug(f"Created entity: {name} ({entity_type})")
 
             except Exception as e:
                 logger.warning(f"Failed to create entity {name}: {e}")
 
         for rel in extraction_result.get("relationships", []):
-            subject_name = rel.get("subject", "").strip()
+            subject_name = rel.get("subject", "").strip()[:MAX_ENTITY_NAME_LENGTH]
             predicate = rel.get("predicate", "").strip()
-            object_name = rel.get("object", "").strip()
+            object_name = rel.get("object", "").strip()[:MAX_ENTITY_NAME_LENGTH]
             object_is_entity = rel.get("object_is_entity", True)
-            confidence = rel.get("confidence", 0.7)
+            confidence = _clamp_confidence(rel.get("confidence", 0.7))
 
             if not subject_name or not predicate or not object_name:
+                continue
+            # Task 5: Reject unknown predicates
+            if predicate not in VALID_PREDICATES:
+                logger.warning(f"Skipping unknown predicate from extraction: {predicate!r}")
                 continue
             # Causal predicates require higher confidence to avoid hallucination
             min_confidence = CAUSAL_MIN_CONFIDENCE if predicate in CAUSAL_PREDICATES else 0.5
@@ -301,7 +324,7 @@ class EntityExtractor:
                     )
 
                 stats["relationships_created"] += 1
-                logger.info(f"Created relationship: {subject_name} -{predicate}-> {object_name}")
+                logger.debug(f"Created relationship: {subject_name} -{predicate}-> {object_name}")
 
             except Exception as e:
                 logger.warning(f"Failed to create relationship: {e}")

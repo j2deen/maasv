@@ -116,6 +116,12 @@ JSON output:"""
             logger.warning("[Inference] Failed to parse response")
             return []
 
+        # Task 2: Cardinality cap
+        MAX_INFERENCES_PER_JOB = 20
+        if len(inferences) > MAX_INFERENCES_PER_JOB:
+            logger.warning(f"[Inference] Capping inferences from {len(inferences)} to {MAX_INFERENCES_PER_JOB}")
+            inferences = inferences[:MAX_INFERENCES_PER_JOB]
+
         logger.info(f"[Inference] Extracted {len(inferences)} inferences")
         return inferences
     except Exception as e:
@@ -133,14 +139,14 @@ def _store_inferences(inferences: list[dict]) -> int:
     if not inferences:
         return 0
 
-    from maasv.core.graph import find_entity_by_name, find_or_create_entity, add_relationship
+    from maasv.core.graph import find_entity_by_name, find_or_create_entity, add_relationship, _clamp_confidence
 
     stored = 0
     for inf in inferences:
         try:
             resolved_name = inf.get("resolved_to")
             entity_type = inf.get("entity_type", "thing")
-            confidence = inf.get("confidence", 0.5)
+            confidence = _clamp_confidence(inf.get("confidence", 0.5))
             reference = inf.get("reference", "")
             evidence = inf.get("evidence", "")
 

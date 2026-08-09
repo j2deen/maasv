@@ -9,12 +9,25 @@ Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (22MB, ~50ms for 50 pairs on M4)
 """
 
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _reranker = None
 _reranker_failed = False
+_reranker_lock = threading.Lock()
+
+# Known-safe cross-encoder models for reranking
+ALLOWED_CROSS_ENCODER_MODELS = {
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "cross-encoder/ms-marco-MiniLM-L-12-v2",
+    "cross-encoder/ms-marco-TinyBERT-L-2-v2",
+    "cross-encoder/stsb-TinyBERT-L-4",
+    "cross-encoder/stsb-distilroberta-base",
+    "BAAI/bge-reranker-base",
+    "BAAI/bge-reranker-v2-m3",
+}
 
 
 def _get_reranker():
@@ -27,26 +40,40 @@ def _get_reranker():
     if _reranker_failed:
         return None
 
-    import maasv
-    config = maasv.get_config()
-    if not config.cross_encoder_enabled:
-        return None
+    with _reranker_lock:
+        # Double-check after acquiring lock
+        if _reranker is not None:
+            return _reranker
+        if _reranker_failed:
+            return None
 
-    try:
-        from sentence_transformers import CrossEncoder
-        model_name = config.cross_encoder_model
-        logger.info(f"Loading cross-encoder model: {model_name}")
-        _reranker = CrossEncoder(model_name)
-        logger.info("Cross-encoder loaded successfully")
-        return _reranker
-    except ImportError:
-        logger.warning("sentence-transformers not installed — cross-encoder disabled")
-        _reranker_failed = True
-        return None
-    except Exception:
-        logger.error("Failed to load cross-encoder model", exc_info=True)
-        _reranker_failed = True
-        return None
+        import maasv
+        config = maasv.get_config()
+        if not config.cross_encoder_enabled:
+            return None
+
+        try:
+            from sentence_transformers import CrossEncoder
+            model_name = config.cross_encoder_model
+            if model_name not in ALLOWED_CROSS_ENCODER_MODELS:
+                logger.error(
+                    f"Cross-encoder model '{model_name}' not in allowlist. "
+                    f"Allowed: {sorted(ALLOWED_CROSS_ENCODER_MODELS)}"
+                )
+                _reranker_failed = True
+                return None
+            logger.info(f"Loading cross-encoder model: {model_name}")
+            _reranker = CrossEncoder(model_name)
+            logger.info("Cross-encoder loaded successfully")
+            return _reranker
+        except ImportError:
+            logger.warning("sentence-transformers not installed — cross-encoder disabled")
+            _reranker_failed = True
+            return None
+        except Exception:
+            logger.error("Failed to load cross-encoder model", exc_info=True)
+            _reranker_failed = True
+            return None
 
 
 def rerank(

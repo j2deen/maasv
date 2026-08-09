@@ -8,6 +8,7 @@ Unlike factual memory (who is the user's spouse, what's their schedule), wisdom 
 experiential — patterns of what works and what doesn't, learned over time.
 """
 
+import logging
 import sqlite3
 import json
 import uuid
@@ -15,7 +16,9 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
-from maasv.core.db import _plain_db as _db
+from maasv.core.db import _plain_db as _db, _sanitize_fts_input
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -189,18 +192,26 @@ def get_relevant_wisdom(
 
 def search_wisdom(query: str, limit: int = 10) -> list[dict]:
     """Full-text search across reasoning, context, and feedback."""
+    query = _sanitize_fts_input(query)
+    if not query:
+        return []
+
     with _db() as conn:
-        rows = conn.execute(
-            """
-            SELECT w.* FROM wisdom w
-            JOIN wisdom_fts fts ON w.rowid = fts.rowid
-            WHERE wisdom_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (query, limit)
-        ).fetchall()
-        return [_row_to_dict(row) for row in rows]
+        try:
+            rows = conn.execute(
+                """
+                SELECT w.* FROM wisdom w
+                JOIN wisdom_fts fts ON w.rowid = fts.rowid
+                WHERE wisdom_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, limit)
+            ).fetchall()
+            return [_row_to_dict(row) for row in rows]
+        except sqlite3.OperationalError:
+            logger.debug("FTS5 query failed in search_wisdom: %s", query, exc_info=True)
+            return []
 
 
 def get_wisdom_by_id(wisdom_id: str) -> Optional[dict]:
@@ -459,7 +470,8 @@ def get_smart_wisdom(
         # 3. Context-based search
         remaining = limit - len(results)
         if remaining > 0 and context:
-            words = [w for w in context.split() if len(w) > 3][:3]
+            words = [_sanitize_fts_input(w) for w in context.split() if len(w) > 3][:3]
+            words = [w for w in words if w]
             if words:
                 search_query = " OR ".join(words)
                 try:
