@@ -20,6 +20,7 @@ from maasv.core.graph import (
     add_relationship,
     expire_relationship,
     get_entity_relationships,
+    get_relationship_history,
     get_causal_chain,
     graph_query,
     get_entity_profile,

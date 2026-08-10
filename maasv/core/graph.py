@@ -52,6 +52,18 @@ VALID_PREDICATES = {
 }
 
 
+# Functional (single-valued) predicates: a subject holds at most ONE active
+# fact per predicate. A new fact is a knowledge UPDATE — the old edge gets
+# valid_to closed (change_reason='superseded_by_new_fact') instead of
+# coexisting. Multi-valued predicates (works_on, uses, friend_of...) coexist.
+# Extend via config.extra_functional_predicates.
+FUNCTIONAL_PREDICATES = {
+    "lives_in", "located_in", "located_at",
+    "works_at", "married_to", "spouse",
+    "has_email", "has_phone", "has_birthday", "has_age",
+}
+
+
 def _sanitize_entity_name(name: str) -> str:
     """Sanitize entity name to allowed characters only.
 
@@ -528,6 +540,21 @@ def add_relationship(
                 db.commit()
             return existing["id"]
 
+        # Bi-temporal knowledge update: for functional (single-valued)
+        # predicates, a new fact with a DIFFERENT object supersedes the old
+        # one — close its validity interval rather than letting both coexist.
+        # ("Alice lives_in Toronto" + "Alice lives_in NYC" -> Toronto edge
+        # gets valid_to = new fact's valid_from.)
+        functional = predicate in (
+            FUNCTIONAL_PREDICATES | maasv.get_config().extra_functional_predicates
+        )
+        if functional:
+            db.execute("""
+                UPDATE relationships
+                SET valid_to = ?, change_reason = 'superseded_by_new_fact'
+                WHERE subject_id = ? AND predicate = ? AND valid_to IS NULL
+            """, (valid_from, subject_id, predicate))
+
         # No existing match — insert new
         rel_id = f"rel_{uuid.uuid4().hex[:12]}"
         try:
@@ -566,16 +593,22 @@ def add_relationship(
 
 def expire_relationship(
     relationship_id: str,
-    valid_to: Optional[str] = None
+    valid_to: Optional[str] = None,
+    change_reason: Optional[str] = None,
 ) -> bool:
-    """Mark a relationship as expired (no longer current)."""
+    """Mark a relationship as expired (no longer current).
+
+    change_reason records WHY the fact stopped being valid
+    (e.g. "user_correction", "contradicted_by_conversation").
+    """
     if valid_to is None:
         valid_to = datetime.now(timezone.utc).isoformat()
 
     with _db() as db:
         cursor = db.execute(
-            "UPDATE relationships SET valid_to = ? WHERE id = ? AND valid_to IS NULL",
-            (valid_to, relationship_id)
+            "UPDATE relationships SET valid_to = ?, change_reason = COALESCE(?, change_reason) "
+            "WHERE id = ? AND valid_to IS NULL",
+            (valid_to, change_reason, relationship_id)
         )
         updated = cursor.rowcount > 0
         db.commit()
@@ -586,12 +619,26 @@ def get_entity_relationships(
     entity_id: str,
     include_expired: bool = False,
     predicate: Optional[str] = None,
-    direction: str = "both"
+    direction: str = "both",
+    as_of: Optional[str] = None,
 ) -> list[dict]:
-    """Get all relationships for an entity."""
+    """Get all relationships for an entity.
+
+    as_of: ISO timestamp for time-travel queries — returns the facts that were
+    valid AT that moment (valid_from <= as_of < valid_to). Overrides
+    include_expired. Example: what did we believe about Alice on June 1st?
+    """
     results = []
     queries = []
     params_list = []
+
+    def _temporal_filter(query: str, params: list) -> str:
+        if as_of is not None:
+            params.extend([as_of, as_of])
+            return query + " AND r.valid_from <= ? AND (r.valid_to IS NULL OR r.valid_to > ?)"
+        if not include_expired:
+            return query + " AND r.valid_to IS NULL"
+        return query
 
     if direction in ("outgoing", "both"):
         query = """
@@ -604,8 +651,7 @@ def get_entity_relationships(
             WHERE r.subject_id = ?
         """
         params = [entity_id]
-        if not include_expired:
-            query += " AND r.valid_to IS NULL"
+        query = _temporal_filter(query, params)
         if predicate:
             query += " AND r.predicate = ?"
             params.append(predicate)
@@ -623,8 +669,7 @@ def get_entity_relationships(
             WHERE r.object_id = ?
         """
         params = [entity_id]
-        if not include_expired:
-            query += " AND r.valid_to IS NULL"
+        query = _temporal_filter(query, params)
         if predicate:
             query += " AND r.predicate = ?"
             params.append(predicate)
@@ -646,6 +691,44 @@ def get_entity_relationships(
         # Track access on the queried entity itself
         _record_entity_access(db, [entity_id])
 
+    return results
+
+
+def get_relationship_history(
+    subject_id: str,
+    predicate: Optional[str] = None,
+) -> list[dict]:
+    """Full timeline of a subject's facts, expired and active, oldest first.
+
+    The bi-temporal audit view: every fact with its validity interval
+    [valid_from, valid_to), when it was ingested, and why it changed.
+    "Alice lived in Toronto until 2026-03, in NYC since" reads straight
+    out of this.
+    """
+    query = """
+        SELECT r.*,
+               e_subj.name as subject_name, e_subj.entity_type as subject_type,
+               e_obj.name as object_name, e_obj.entity_type as object_type
+        FROM relationships r
+        JOIN entities e_subj ON r.subject_id = e_subj.id
+        LEFT JOIN entities e_obj ON r.object_id = e_obj.id
+        WHERE r.subject_id = ?
+    """
+    params: list = [subject_id]
+    if predicate:
+        query += " AND r.predicate = ?"
+        params.append(predicate)
+    query += " ORDER BY r.valid_from ASC, r.created_at ASC"
+
+    with _db() as db:
+        rows = db.execute(query, params).fetchall()
+
+    results = []
+    for row in rows:
+        row_dict = dict(row)
+        if row_dict.get("metadata"):
+            row_dict["metadata"] = json.loads(row_dict["metadata"])
+        results.append(row_dict)
     return results
 
 

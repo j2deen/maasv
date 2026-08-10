@@ -85,6 +85,10 @@ class MaasvConfig:
     # Extra predicates to extend VALID_PREDICATES (for host apps with existing data)
     extra_predicates: set[str] = field(default_factory=set)
 
+    # Extra single-valued predicates: new facts auto-invalidate the previous
+    # active fact for the same (subject, predicate). See graph.FUNCTIONAL_PREDICATES.
+    extra_functional_predicates: set[str] = field(default_factory=set)
+
     # Action type groupings for wisdom "similar enough" matching
     action_families: dict[str, list[str]] = field(default_factory=dict)
 
