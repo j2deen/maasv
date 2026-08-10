@@ -46,6 +46,11 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
+      - name: Build runtime bundle
+        working-directory: openclaw
+        run: |
+          npm install --no-save esbuild@^0.24.0 @sinclair/typebox@^0.34.0
+          npm run build
       - name: Publish
         working-directory: openclaw
         run: npm publish
