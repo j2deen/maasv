@@ -1,0 +1,51 @@
+name: Publish plugin to npm
+
+# Publishes openclaw/ on plugin version tags (plugin-v0.1.1, ...) via npm
+# Trusted Publishing (OIDC) — no token stored in the repo. One-time setup on
+# npmjs.com: package @maev-ai/evolving-agents -> Settings -> Trusted Publisher
+# -> GitHub Actions: repository j2deen/maev, workflow publish-npm.yml.
+
+on:
+  push:
+    tags: ["plugin-v*"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Type-check the plugin
+        working-directory: openclaw
+        run: |
+          npm install --no-save typescript@~5.5.0 @sinclair/typebox@^0.34.0
+          npx tsc --noEmit -p tsconfig.json
+      - name: Verify tag matches package version
+        working-directory: openclaw
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#plugin-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION" >&2
+            exit 1
+          fi
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC for npm Trusted Publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
+      - name: Publish
+        working-directory: openclaw
+        run: npm publish
