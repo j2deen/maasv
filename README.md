@@ -26,9 +26,11 @@ Most memory tools store and retrieve. That's two steps. maasv owns seven:
 
 **Store.** Memories are embedded, categorized, and deduplicated on the way in. Each one carries metadata: confidence, importance, subject, and access history.
 
-**Consolidate.** During idle time, maasv merges near-duplicates, clusters related memories, resolves vague references to specific entities, and pre-computes common graph paths. Your agent's understanding gets sharper while nobody's using it.
+**Consolidate.** During idle time, maasv merges near-duplicates, clusters related memories, resolves vague references to specific entities, and pre-computes common graph paths. New memories also evolve old ones (A-MEM style): each newly stored memory gets linked bidirectionally to semantically related older memories, and optionally the LLM re-tags the older side in light of the new context. Your agent's understanding gets sharper while nobody's using it.
 
-**Retrieve.** Three signals fused together: dense vector search (semantic similarity), BM25 keyword matching (exact terms via FTS5), and graph connectivity (1-hop entity expansion). Merged with Reciprocal Rank Fusion, scored for importance, then optionally refined by a cross-encoder in a two-stage rerank — importance decides which memories are candidates, the cross-encoder only reorders within that set. This is how your agent finds the thing it didn't know it was looking for.
+**Retrieve.** Three signals fused together: dense vector search (semantic similarity), BM25 keyword matching (exact terms via FTS5), and graph connectivity via Personalized PageRank — a HippoRAG-style multi-hop walk from query entities, so a fact two or three hops away still earns retrieval weight (legacy 1-hop expansion remains as a fallback). Merged with Reciprocal Rank Fusion, scored for importance, then optionally refined by a cross-encoder in a two-stage rerank — importance decides which memories are candidates, the cross-encoder only reorders within that set. A fusion-rescue pass guarantees that strong graph/BM25 hits with no vector-search presence can still claim result slots. This is how your agent finds the thing it didn't know it was looking for.
+
+Knowledge updates are bi-temporal: single-valued predicates (`lives_in`, `works_at`, `married_to`, ...) auto-close the previous fact's validity interval when a conflicting fact arrives, backfilled historical facts land pre-closed in the right slot of the timeline, `get_entity_relationships(as_of=...)` answers "what did we believe on June 1st?", and `get_relationship_history()` returns the full audit trail with change reasons.
 
 **Decay.** Memories that stop being accessed lose confidence over time. Protected categories (identity, family, core preferences) are exempt. Everything else has to earn its place.
 
@@ -86,9 +88,17 @@ add_relationship(alice, "works_on", object_id=project_x)
 from maasv.core.retrieval import find_similar_memories
 results = find_similar_memories("who's working on ProjectX?", limit=5)
 
-# Or get tiered context for your LLM prompt
+# Or get tiered context for your LLM prompt — optionally packed to a token
+# budget (query-relevant facts first) and compact-grouped by subject
 from maasv.core.retrieval import get_tiered_memory_context
 context = get_tiered_memory_context(query="meeting prep for Alice")
+tight = get_tiered_memory_context(query="meeting prep for Alice",
+                                  token_budget=150, compact=True)
+
+# Bi-temporal graph queries: time-travel and audit history
+from maasv.core.graph import get_entity_relationships, get_relationship_history
+then = get_entity_relationships(alice, as_of="2026-06-01T00:00:00+00:00")
+timeline = get_relationship_history(alice, predicate="works_at")
 ```
 
 See [`examples/quickstart.py`](examples/quickstart.py) for a complete runnable example with mock providers.
@@ -104,7 +114,9 @@ maasv.init(config, llm, embed)
     +-- core/
     |   +-- store.py           Memory CRUD (store, supersede, delete)
     |   +-- retrieval.py       3-signal retrieval + reranking + tiered context
-    |   +-- graph.py           Knowledge graph (entities, relationships, traversal)
+    |   +-- ppr.py             Personalized PageRank graph signal (multi-hop, pure Python)
+    |   +-- graph.py           Knowledge graph (entities, bi-temporal relationships,
+    |   |                      as-of queries, history, traversal)
     |   +-- wisdom.py          Experiential learning (log, outcome, feedback)
     |   +-- db.py              SQLite + sqlite-vec, migrations, access tracking
     |   +-- reranker.py        Optional cross-encoder (lazy-loaded)
@@ -121,6 +133,8 @@ maasv.init(config, llm, embed)
     |   +-- inference.py      Resolve vague references to specific entities
     |   +-- review.py         Second-pass conversation analysis
     |   +-- learn.py          Label retrieval logs, train ranker, check graduation
+    |   +-- evolve.py         Memory evolution: link new memories to related old
+    |                         ones, optional LLM re-tagging (A-MEM style)
     |
     +-- providers/
     |   +-- ollama.py         Built-in Ollama embed provider (default)
@@ -128,6 +142,10 @@ maasv.init(config, llm, embed)
     +-- mcp_server/           MCP server: 20 tools (memory, graph, wisdom, extraction)
     +-- server/               REST API server (FastAPI: memory, graph, wisdom,
                               extraction, health routers)
+
+evals/                        Dev-only eval harness (not shipped in the package):
+                              recall@k / MRR / tokens-injected on a deterministic
+                              corpus, with a full-context control arm
 ```
 
 Everything talks to one SQLite database. No Redis, no Postgres, no external services. The entire state of an agent's memory is a single `.db` file you can copy, back up, or throw away.
@@ -181,6 +199,10 @@ config = MaasvConfig(
     # Retrieval tuning
     diversity_threshold=0.0,            # Jaccard dedup (0.0 = off, 0.7 = moderate)
     category_priority={"identity": 1, "family": 2, "preference": 3},  # Tiered context order
+    graph_retrieval="ppr",              # "ppr" (multi-hop PageRank) or "one_hop" (legacy)
+    rrf_rank_weight=0.15,               # Fused-rank strength in final scoring
+    fusion_rescue_top_n=5,              # Rescue graph/BM25-only hits from this signal depth
+    fusion_rescue_slots=2,              # ...into up to this many tail result slots
 
     # Cross-encoder (opt-in)
     cross_encoder_enabled=False,
@@ -198,7 +220,13 @@ config = MaasvConfig(
 
     # Graph
     extra_predicates=set(),             # Extend the built-in predicate allowlist
+    extra_functional_predicates=set(),  # Single-valued predicates (auto-invalidate old facts)
     known_entities={"Alice": "person", "ProjectX": "project"},  # Helps extraction avoid duplicates
+
+    # Memory evolution (sleep-time linking of new memories to related old ones)
+    evolve_enabled=True,
+    evolve_link_threshold=0.70,         # Cosine floor for a link
+    evolve_llm_refresh=False,           # LLM re-tags linked older memories
 
     # Wisdom
     action_families={},                 # Action type groupings for "similar enough" matching
@@ -266,6 +294,17 @@ maasv-server                           # defaults to 127.0.0.1:18790
 ```
 
 Both configure via `MAASV_`-prefixed environment variables (or a `.env` file): `MAASV_DB_PATH`, `MAASV_LLM_PROVIDER` (`anthropic` or `openai`), `MAASV_LLM_API_KEY`, `MAASV_EMBED_PROVIDER` (`ollama`, `voyage`, or `openai`), and friends. Since the servers own the process, they construct providers for you from those variables — this is where the `anthropic`, `openai`, and `voyage` extras come in.
+
+## Evals
+
+The repo (not the pip package) ships a deterministic eval harness — the answer to a field where most memory-system numbers are vendor-self-reported:
+
+```bash
+python -m evals.run_eval          # human-readable report
+python -m evals.run_eval --json   # full metrics
+```
+
+It scores recall@1/@k, MRR, and tokens injected per query across three arms: the main retrieval pipeline, tiered context, and a full-context control (every memory concatenated — what you'd pay without a memory system). Questions are tagged by retrieval mechanism (keyword / paraphrase / graph 1-hop / graph 2-hop) so you can see which signal a change helped or hurt. Runs are byte-for-byte reproducible: pinned IDs, pinned timestamps, hash-seed-independent scoring. If you change retrieval code, run this before and after.
 
 ## Status
 
