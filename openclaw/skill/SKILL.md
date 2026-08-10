@@ -38,6 +38,13 @@ openclaw plugins install @maev-ai/evolving-agents
     entries: {
       "memory-maev": {
         enabled: true,
+        // OpenClaw 2026.7.x: required for auto-recall / auto-capture —
+        // typed hooks from non-bundled plugins are blocked without them.
+        hooks: {
+          allowConversationAccess: true,
+          allowPromptInjection: true,
+          timeoutMs: 180000
+        },
         config: {
           serverUrl: "http://127.0.0.1:18790",
           autoRecall: true,
@@ -46,6 +53,17 @@ openclaw plugins install @maev-ai/evolving-agents
         }
       }
     }
+  }
+}
+```
+
+On OpenClaw 2026.7.x also allowlist the optional tools, or agents won't see
+them:
+
+```json5
+{
+  tools: {
+    alsoAllow: ["memory_graph", "memory_wisdom"]
   }
 }
 ```

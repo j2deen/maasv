@@ -34,6 +34,13 @@ openclaw plugins install @maev-ai/evolving-agents
     entries: {
       "memory-maev": {
         enabled: true,
+        // OpenClaw 2026.7.x: non-bundled plugins must opt in to typed hooks.
+        // Without these, auto-recall and auto-capture are silently blocked.
+        hooks: {
+          allowConversationAccess: true, // agent_end may read the conversation (auto-capture)
+          allowPromptInjection: true,    // before_agent_start may prepend memory context (auto-recall)
+          timeoutMs: 180000              // entity extraction can exceed the default hook timeout
+        },
         config: {
           serverUrl: "http://127.0.0.1:18790",
           autoRecall: true,
@@ -45,6 +52,23 @@ openclaw plugins install @maev-ai/evolving-agents
   }
 }
 ```
+
+3. (OpenClaw 2026.7.x) Expose the optional tools. `memory_graph` and
+`memory_wisdom` are registered as *optional* and stay hidden from agents until
+allowlisted:
+```json5
+// ~/.openclaw/openclaw.json
+{
+  tools: {
+    alsoAllow: ["memory_graph", "memory_wisdom"]
+  }
+}
+```
+
+> **Version note:** use plugin `>= 0.1.1` on OpenClaw 2026.7.x — `0.1.0`
+> shipped TypeScript-only (rejected by the 2026.7.x npm plugin loader), lacked
+> the `contracts.tools` declaration, and predates the 2026.7.x typed-hook
+> event shapes, so its auto-recall/auto-capture never fired there.
 
 ## Tools
 
