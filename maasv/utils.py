@@ -6,6 +6,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def estimate_tokens(text: str) -> int:
+    """Model-free token estimate (~4 chars/token). Used for context budgeting;
+    intentionally conservative and dependency-free rather than exact."""
+    return max(1, round(len(text) / 4))
+
+
 def parse_llm_json(content: str) -> dict | list | None:
     """
     Parse JSON from an LLM response, handling markdown code blocks.

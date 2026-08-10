@@ -1032,7 +1032,9 @@ def get_tiered_memory_context(
     query: str = None,
     core_limit: int = 10,
     relevant_limit: int = 5,
-    use_semantic: bool = False
+    use_semantic: bool = False,
+    token_budget: Optional[int] = None,
+    compact: bool = False,
 ) -> str:
     """
     Smart memory retrieval with tiered approach for low latency.
@@ -1040,16 +1042,31 @@ def get_tiered_memory_context(
     Tier 1: Core memories (family, identity, prefs) - cached, instant
     Tier 2: Query-relevant via FTS keyword search - fast (~2ms)
     Tier 3: Semantic search - slow (~400ms), only if use_semantic=True
+
+    token_budget: approximate cap (via utils.estimate_tokens) on the returned
+    context. Memories are packed greedily in tier order — core facts first,
+    query-relevant next, filler last — and packing stops at the budget, so the
+    most salient facts survive. At least one fact is always included.
+
+    compact: group facts by subject ("Marcus: fact; fact") instead of one
+    bulleted line each — same information, fewer tokens.
     """
     seen_ids = set()
     memories = []
 
-    # Tier 1: Always include core memories (cached)
+    # Under a token budget with a query, query-relevant facts pack FIRST:
+    # a tight budget otherwise fills up with core facts and cuts exactly the
+    # memories the query needs. Without a budget, tier order is unchanged.
+    relevant_first = token_budget is not None and bool(query)
+
     core = get_core_memories()[:core_limit]
-    for mem in core:
-        if mem['id'] not in seen_ids:
-            memories.append(mem)
-            seen_ids.add(mem['id'])
+
+    if not relevant_first:
+        # Tier 1: Always include core memories (cached)
+        for mem in core:
+            if mem['id'] not in seen_ids:
+                memories.append(mem)
+                seen_ids.add(mem['id'])
 
     # Tier 2: Add query-relevant memories via FTS (fast)
     if query and len(memories) < core_limit + relevant_limit:
@@ -1073,6 +1090,13 @@ def get_tiered_memory_context(
         semantic_results = find_similar_memories(query, limit=remaining)
         for mem in semantic_results:
             if mem['id'] not in seen_ids:
+                memories.append(mem)
+                seen_ids.add(mem['id'])
+
+    if relevant_first:
+        # Core memories follow the query-relevant ones
+        for mem in core:
+            if mem['id'] not in seen_ids and len(memories) < core_limit + relevant_limit:
                 memories.append(mem)
                 seen_ids.add(mem['id'])
 
@@ -1105,10 +1129,42 @@ def get_tiered_memory_context(
     if not memories:
         return ""
 
-    lines = ["Remembered facts:"]
-    for mem in memories:
-        subject_str = f"[{mem['subject']}] " if mem.get('subject') else ""
-        lines.append(f"- {subject_str}{mem['content']}")
+    from maasv.utils import estimate_tokens
+
+    if compact:
+        # Group by subject: "Marcus: fact; fact" — repeated subjects and
+        # bullet scaffolding are pure token overhead. Insertion (tier) order
+        # is preserved for both groups and facts within a group.
+        groups: dict = {}
+        order: list = []
+        for mem in memories:
+            key = mem.get('subject') or ""
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(mem['content'])
+        lines = ["Remembered facts:"]
+        for key in order:
+            joined = "; ".join(groups[key])
+            lines.append(f"{key}: {joined}" if key else f"- {joined}")
+    else:
+        lines = ["Remembered facts:"]
+        for mem in memories:
+            subject_str = f"[{mem['subject']}] " if mem.get('subject') else ""
+            lines.append(f"- {subject_str}{mem['content']}")
+
+    if token_budget is not None:
+        # Greedy pack in salience (tier) order: header + at least one fact,
+        # then facts until the budget is spent.
+        packed = [lines[0]]
+        used = estimate_tokens(lines[0])
+        for i, line in enumerate(lines[1:]):
+            cost = estimate_tokens(line)
+            if i > 0 and used + cost > token_budget:
+                break
+            packed.append(line)
+            used += cost
+        lines = packed
 
     return _redact_text("\n".join(lines))
 

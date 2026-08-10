@@ -20,6 +20,7 @@ from evals.corpus import Corpus, build_corpus
 from evals.providers import HashedBowEmbed, NullLLM
 
 EMBED_DIMS = 256
+BUDGET_TOKENS = 120  # budgeted-tiered arm: token_budget passed to context packing
 
 
 def approx_tokens(text: str) -> int:
@@ -110,6 +111,12 @@ def run_eval(k: int = 5, config_overrides: Optional[dict] = None,
             tiered_hit = any(g in context for g in gold_contents)
             tiered_tokens = approx_tokens(context)
 
+            budgeted = get_tiered_memory_context(
+                query=qa.question, token_budget=BUDGET_TOKENS, compact=True
+            )
+            budget_hit = any(g in budgeted for g in gold_contents)
+            budget_tokens = approx_tokens(budgeted)
+
             per_question.append({
                 "question": qa.question,
                 "type": qa.qa_type,
@@ -117,6 +124,8 @@ def run_eval(k: int = 5, config_overrides: Optional[dict] = None,
                 "retrieval_tokens": retrieval_tokens,
                 "tiered_hit": tiered_hit,
                 "tiered_tokens": tiered_tokens,
+                "budget_hit": budget_hit,
+                "budget_tokens": budget_tokens,
             })
 
     n = len(per_question)
@@ -142,6 +151,11 @@ def run_eval(k: int = 5, config_overrides: Optional[dict] = None,
             "gold_in_context_rate": sum(q["tiered_hit"] for q in per_question) / n,
             "mean_tokens": sum(q["tiered_tokens"] for q in per_question) / n,
         },
+        "tiered_budget": {
+            "budget": BUDGET_TOKENS,
+            "gold_in_context_rate": sum(q["budget_hit"] for q in per_question) / n,
+            "mean_tokens": sum(q["budget_tokens"] for q in per_question) / n,
+        },
         "full_context": {
             "gold_in_context_rate": 1.0,
             "mean_tokens": full_context_tokens,
@@ -166,10 +180,12 @@ def format_report(metrics: dict) -> str:
         lines.append(f"{'  ' + t:<22}{tr['recall_at_1']:>7.2f}{tr[f'recall_at_{k}']:>7.2f}"
                      f"{tr['mrr']:>7.2f}{tr['mean_tokens']:>9.0f}")
     t = metrics["tiered"]
+    tb = metrics["tiered_budget"]
     f = metrics["full_context"]
     lines += [
         "-" * 52,
         f"{'tiered context':<22}{'':>7}{t['gold_in_context_rate']:>7.2f}{'':>7}{t['mean_tokens']:>9.0f}",
+        f"{'tiered (budget ' + str(tb['budget']) + ')':<22}{'':>7}{tb['gold_in_context_rate']:>7.2f}{'':>7}{tb['mean_tokens']:>9.0f}",
         f"{'full-context control':<22}{'':>7}{f['gold_in_context_rate']:>7.2f}{'':>7}{f['mean_tokens']:>9.0f}",
     ]
     misses = [q for q in metrics["per_question"] if not q["hit_at_k"]]
