@@ -12,10 +12,10 @@ This skill requires the `@maev-ai/evolving-agents` plugin and a running maev ser
 
 ### 1. Start the server
 
-From a checkout of [j2deen/maev](https://github.com/j2deen/maev):
+
 
 ```bash
-pip install -e ".[server,anthropic,voyage]"
+pip install "maev[server,anthropic,voyage]"
 # configure via MAEV_* environment variables or a .env file (see below)
 maev-server
 ```
@@ -102,4 +102,4 @@ The maev server needs an LLM provider (for entity extraction) and an embedding p
 ## Links
 
 - **Plugin (npm):** [@maev-ai/evolving-agents](https://www.npmjs.com/package/@maev-ai/evolving-agents)
-- **Server + core:** [github.com/j2deen/maev](https://github.com/j2deen/maev) (not yet on PyPI)
+- **Server + core:** [github.com/j2deen/maev](https://github.com/j2deen/maev) · [`pip install maev`](https://pypi.org/project/maev/)

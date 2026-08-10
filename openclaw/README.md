@@ -11,9 +11,9 @@ Gives OpenClaw agents structured long-term memory backed by SQLite: 3-signal ret
 
 ## Prerequisites
 
-A running maev server instance. From the repository root:
+A running maev server instance:
 ```bash
-pip install -e ".[server,anthropic,voyage]"
+pip install "maev[server,anthropic,voyage]"
 maev-server
 ```
 See the [MAEV README](../README.md) for full setup details.
