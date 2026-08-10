@@ -1,7 +1,7 @@
 {
-  "name": "@maev/openclaw-memory",
+  "name": "@maev-ai/evolving-agents",
   "version": "0.1.0",
-  "description": "OpenClaw memory plugin powered by maev — cognition layer with knowledge graph, lifecycle management, and experiential learning",
+  "description": "MAEV — Memory Architecture for Evolving Agents. Currently ships the OpenClaw memory plugin: knowledge graph, multi-hop retrieval, lifecycle management, and experiential learning via a maev server.",
   "type": "module",
   "main": "index.ts",
   "license": "BSL-1.1",

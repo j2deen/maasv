@@ -8,7 +8,7 @@ Replaces the default memory backend with a cognition layer that includes 3-signa
 
 ## Install
 
-This skill requires the `@maev/openclaw-memory` plugin and a running maev server.
+This skill requires the `@maev-ai/evolving-agents` plugin and a running maev server.
 
 ### 1. Start the server
 
