@@ -541,30 +541,44 @@ def add_relationship(
             return existing["id"]
 
         # Bi-temporal knowledge update: for functional (single-valued)
-        # predicates, a new fact with a DIFFERENT object supersedes the old
-        # one — close its validity interval rather than letting both coexist.
-        # ("Alice lives_in Toronto" + "Alice lives_in NYC" -> Toronto edge
-        # gets valid_to = new fact's valid_from.)
+        # predicates, a new fact supersedes only facts that are OLDER
+        # (valid_from <= incoming) — closing newer facts would corrupt their
+        # intervals. A backfilled historical fact (incoming valid_from earlier
+        # than an existing fact) instead lands pre-closed at the next fact's
+        # valid_from, so the timeline stays consistent:
+        # add NYC@2026-06, backfill Toronto@2026-01 ->
+        # Toronto [2026-01, 2026-06), NYC [2026-06, active).
         functional = predicate in (
             FUNCTIONAL_PREDICATES | maasv.get_config().extra_functional_predicates
         )
+        incoming_valid_to = None
         if functional:
             db.execute("""
                 UPDATE relationships
                 SET valid_to = ?, change_reason = 'superseded_by_new_fact'
                 WHERE subject_id = ? AND predicate = ? AND valid_to IS NULL
-            """, (valid_from, subject_id, predicate))
+                AND valid_from <= ?
+            """, (valid_from, subject_id, predicate, valid_from))
+
+            newer = db.execute("""
+                SELECT MIN(valid_from) AS next_from FROM relationships
+                WHERE subject_id = ? AND predicate = ? AND valid_from > ?
+            """, (subject_id, predicate, valid_from)).fetchone()
+            if newer and newer["next_from"]:
+                incoming_valid_to = newer["next_from"]
 
         # No existing match — insert new
         rel_id = f"rel_{uuid.uuid4().hex[:12]}"
         try:
             db.execute("""
                 INSERT INTO relationships
-                (id, subject_id, predicate, object_id, object_value, valid_from, confidence, source, metadata, origin, origin_interface)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, subject_id, predicate, object_id, object_value, valid_from, valid_to, change_reason, confidence, source, metadata, origin, origin_interface)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 rel_id, subject_id, predicate, object_id, object_value,
-                valid_from, confidence, source,
+                valid_from, incoming_valid_to,
+                "backfilled_historical" if incoming_valid_to else None,
+                confidence, source,
                 json.dumps(metadata) if metadata else None,
                 origin, origin_interface,
             ))

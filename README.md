@@ -241,7 +241,12 @@ config = MaasvConfig(
 
 If the hook raises, maasv fails closed: the text is replaced with `[redacted]` rather than passed through.
 
-Combined, the cloud model only ever sees redacted, already-extracted facts — never the corpus, never raw conversations.
+Combined, a host app that builds cloud prompts from those four retrieval functions sends only redacted, already-extracted facts — never the corpus, never raw conversations.
+
+**Scope — read this before relying on it.** `redact_output` covers exactly the four retrieval functions listed above: the surfaces designed for prompt assembly. It does NOT apply to:
+
+- Direct CRUD/graph reads (`get_all_active`, `get_recent_memories`, `get_entity_profile`, `graph_query`, `get_relationship_history`) — these return raw stored content, on purpose: local lifecycle jobs (extraction, review, hygiene) need unredacted text to work.
+- The bundled MCP and REST servers. They configure themselves from environment variables and a redaction hook is a Python callable, so they run without one — their tools (e.g. `maasv_memory_facts`, `maasv_graph_entity_profile`) and routes (e.g. `GET /memory/{id}`) return raw stored content. Do not point a cloud-model MCP client at `maasv-mcp` and expect redaction; for sensitive corpora, embed maasv as a library behind your own redaction-aware server.
 
 ## Servers
 

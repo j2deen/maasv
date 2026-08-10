@@ -25,20 +25,33 @@ logger = logging.getLogger("maasv.lifecycle.evolve")
 WATERMARK_KEY = "evolve_watermark"
 
 
-def _get_watermark(db) -> Optional[str]:
+def _get_watermark(db) -> Optional[tuple[str, str]]:
+    """Composite (created_at, id) watermark. created_at has second granularity
+    (SQLite CURRENT_TIMESTAMP), so ties are common — a timestamp-only watermark
+    with a strict '>' filter would skip same-second memories forever."""
     row = db.execute(
         "SELECT value FROM db_meta WHERE key = ?", (WATERMARK_KEY,)
     ).fetchone()
-    return row["value"] if row else None
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row["value"])
+        if isinstance(parsed, list) and len(parsed) == 2:
+            return (parsed[0], parsed[1])
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Legacy plain-timestamp watermark: id "" sorts before every real id,
+    # so same-second rows are (re)considered rather than skipped
+    return (row["value"], "")
 
 
-def _set_watermark(db, ts: str) -> None:
+def _set_watermark(db, created_at: str, mem_id: str) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     db.execute("""
         INSERT INTO db_meta (key, value, created_at, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    """, (WATERMARK_KEY, ts, now, now))
+    """, (WATERMARK_KEY, json.dumps([created_at, mem_id]), now, now))
 
 
 def _load_metadata(raw: Optional[str]) -> dict:
@@ -112,7 +125,16 @@ def _refresh_tags(db, memory: dict, new_content: str, model: str) -> bool:
     if not tags:
         return False
 
-    meta = _load_metadata(memory.get("metadata"))
+    # Re-read metadata from the DB: the row dict `memory` was captured by the
+    # KNN SELECT before _add_links wrote related_ids — merging into that stale
+    # copy would erase the backlink (and any other concurrent writer's keys).
+    row = db.execute(
+        "SELECT metadata FROM memories WHERE id = ? AND superseded_by IS NULL",
+        (memory["id"],)
+    ).fetchone()
+    if row is None:
+        return False
+    meta = _load_metadata(row["metadata"])
     if meta.get("tags") == tags:
         return False
     meta["tags"] = tags
@@ -147,8 +169,9 @@ def run_evolve_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
         params: list = []
         where = "m.superseded_by IS NULL"
         if watermark:
-            where += " AND m.created_at > ?"
-            params.append(watermark)
+            # Keyset pagination on (created_at, id) — matches the ORDER BY
+            where += " AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?))"
+            params.extend([watermark[0], watermark[0], watermark[1]])
         params.append(batch_size)
 
         new_memories = db.execute(f"""
@@ -162,12 +185,12 @@ def run_evolve_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
         if not new_memories:
             return stats
 
-        latest_created = None
+        latest_processed = None
         for mem in new_memories:
             if cancel_check():
                 stats["cancelled"] = True
                 break
-            latest_created = mem["created_at"]
+            latest_processed = (mem["created_at"], mem["id"])
             stats["processed"] += 1
 
             emb_row = db.execute(
@@ -219,8 +242,8 @@ def run_evolve_job(data: dict, cancel_check: Callable[[], bool]) -> dict:
                     if _refresh_tags(db, r, mem["content"], config.review_model):
                         stats["tags_refreshed"] += 1
 
-        if latest_created is not None:
-            _set_watermark(db, latest_created)
+        if latest_processed is not None:
+            _set_watermark(db, latest_processed[0], latest_processed[1])
         db.commit()
 
     logger.info(

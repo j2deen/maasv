@@ -29,7 +29,14 @@ def approx_tokens(text: str) -> int:
 
 
 def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = None) -> dict[str, str]:
-    """Init a fresh maasv db, load the corpus. Returns memory key -> id map."""
+    """Init a fresh maasv db, load the corpus. Returns memory key -> id map.
+
+    Memory/entity IDs are pinned to a deterministic sequence for the duration
+    of corpus loading: several ranking tie-breakers fall back to the ID, and
+    random uuid4 IDs would make exact-tie ordering differ run to run.
+    """
+    import itertools
+    import uuid as _uuid
     import maasv
     from maasv.config import MaasvConfig
 
@@ -38,6 +45,14 @@ def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = Non
         embed_dims=EMBED_DIMS,
         cross_encoder_enabled=False,
         learned_ranker_enabled=False,  # deterministic evals: heuristic scoring only
+        # All corpus categories protected -> decay_factor is exactly 1.0 for
+        # every memory. Otherwise decay depends on wall-clock datetime.now()
+        # and consecutive runs differ at ~1e-9 — enough to flip float-tied
+        # ranks and make eval runs non-reproducible.
+        protected_categories={
+            "project", "person", "preference", "history", "identity",
+            "family", "learning",
+        },
     )
     kwargs.update(config_overrides or {})
     maasv.init(config=MaasvConfig(**kwargs), llm=NullLLM(), embed=HashedBowEmbed(dims=EMBED_DIMS))
@@ -46,17 +61,25 @@ def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = Non
     from maasv.core.graph import find_or_create_entity, add_relationship
     from maasv.core.retrieval import get_core_memories
 
-    key_to_id: dict[str, str] = {}
-    for mem in corpus.memories:
-        key_to_id[mem.key] = store_memory(
-            mem.content, category=mem.category, subject=mem.subject, source="eval"
-        )
+    counter = itertools.count(1)
+    real_uuid4 = _uuid.uuid4
+    # Counter in the HIGH bits: id generators take uuid4().hex[:12], the
+    # first 12 hex chars, which low-bit counters would leave all-zero
+    _uuid.uuid4 = lambda: _uuid.UUID(int=next(counter) << 96)
+    try:
+        key_to_id: dict[str, str] = {}
+        for mem in corpus.memories:
+            key_to_id[mem.key] = store_memory(
+                mem.content, category=mem.category, subject=mem.subject, source="eval"
+            )
 
-    entity_ids: dict[str, str] = {}
-    for name, etype in corpus.entities:
-        entity_ids[name] = find_or_create_entity(name, etype)
-    for subj, pred, obj in corpus.relationships:
-        add_relationship(entity_ids[subj], pred, object_id=entity_ids[obj])
+        entity_ids: dict[str, str] = {}
+        for name, etype in corpus.entities:
+            entity_ids[name] = find_or_create_entity(name, etype)
+        for subj, pred, obj in corpus.relationships:
+            add_relationship(entity_ids[subj], pred, object_id=entity_ids[obj])
+    finally:
+        _uuid.uuid4 = real_uuid4
 
     # Pin every timestamp to one instant: created_at ties and decay factors are
     # then identical run-to-run, so evals can't flake on second boundaries.

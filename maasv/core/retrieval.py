@@ -383,7 +383,7 @@ def _find_memories_by_graph(db, query: str, limit: int = 50) -> list[dict]:
                 WHERE (r.subject_id IN ({placeholders}) OR r.object_id IN ({placeholders}))
                 AND r.valid_to IS NULL
                 LIMIT 20
-            """, list(direct_entity_ids) * 3).fetchall()
+            """, sorted(direct_entity_ids) * 3).fetchall()
 
             for row in related_rows:
                 if row["name"] and row["name"] not in direct_entity_names:
@@ -596,13 +596,19 @@ def _find_memories_by_ppr(db, query: str, limit: int = 50) -> list[dict]:
         return []
 
     from maasv.core.ppr import personalized_pagerank
-    scores = personalized_pagerank(
-        db,
-        [s["id"] for s in seeds],
-        alpha=config.ppr_alpha,
-        iterations=config.ppr_iterations,
-        max_nodes=config.ppr_max_nodes,
-    )
+    try:
+        scores = personalized_pagerank(
+            db,
+            [s["id"] for s in seeds],
+            alpha=config.ppr_alpha,
+            iterations=config.ppr_iterations,
+            max_nodes=config.ppr_max_nodes,
+        )
+    except Exception:
+        # The graph signal must never take down retrieval — an empty result
+        # makes find_similar_memories fall back to legacy one-hop expansion.
+        logger.warning("PPR scoring failed; falling back to one-hop", exc_info=True)
+        return []
     if not scores:
         return []
 
@@ -941,6 +947,28 @@ def find_similar_memories(
                         if best_candidate and best_score[0] > 0:
                             result[-1] = best_candidate
 
+        # === Fusion rescue ===
+        # Supplementary (no-vector-distance) candidates sort after every
+        # primary candidate, so a rank-1 graph/BM25 hit is unreachable once
+        # the corpus exceeds the vector window. Candidates in the top N of
+        # their own signal claim up to fusion_rescue_slots tail slots,
+        # strongest fused score first.
+        rescue_n = config.fusion_rescue_top_n
+        rescue_slots = min(config.fusion_rescue_slots, max(0, limit - 1))
+        if rescue_n > 0 and rescue_slots > 0 and supplementary and len(result) >= limit:
+            result_ids = {m['id'] for m in result}
+            top_signal_ids = (
+                {r['id'] for r in graph_results[:rescue_n]}
+                | {r['id'] for r in bm25_results[:rescue_n]}
+            )
+            eligible = sorted(
+                (m for m in supplementary
+                 if m['id'] not in result_ids and m['id'] in top_signal_ids),
+                key=lambda m: (-(m.get('rrf_score') or 0.0), m['id']),
+            )
+            for i, cand in enumerate(eligible[:rescue_slots]):
+                result[-(i + 1)] = cand
+
         # Clean up internal scoring fields, expose relevance
         for mem in result:
             # Expose relevance from L2 distance on normalized vectors.
@@ -1131,6 +1159,39 @@ def get_tiered_memory_context(
 
     from maasv.utils import estimate_tokens
 
+    header = "Remembered facts:"
+
+    if token_budget is not None:
+        # Greedy pack PER FACT in salience (tier) order BEFORE any compact
+        # grouping — grouping first would merge unbudgeted facts into a line
+        # that ships whole and blows the cap. Header + first fact always
+        # included. Cost is the fact's actual incremental rendering: in
+        # compact mode a fact joining an existing subject group costs only
+        # "; fact", so compact packing fits more facts under the same budget.
+        selected = []
+        seen_subjects = set()
+        used = estimate_tokens(header)
+        for i, mem in enumerate(memories):
+            subject = mem.get('subject') or ""
+            if compact:
+                if subject and subject in seen_subjects:
+                    rendered = f"; {mem['content']}"
+                elif subject:
+                    rendered = f"{subject}: {mem['content']}"
+                else:
+                    rendered = f"- {mem['content']}"
+            else:
+                subject_str = f"[{subject}] " if subject else ""
+                rendered = f"- {subject_str}{mem['content']}"
+            cost = estimate_tokens(rendered)
+            if i > 0 and used + cost > token_budget:
+                break
+            selected.append(mem)
+            if subject:
+                seen_subjects.add(subject)
+            used += cost
+        memories = selected
+
     if compact:
         # Group by subject: "Marcus: fact; fact" — repeated subjects and
         # bullet scaffolding are pure token overhead. Insertion (tier) order
@@ -1143,28 +1204,15 @@ def get_tiered_memory_context(
                 groups[key] = []
                 order.append(key)
             groups[key].append(mem['content'])
-        lines = ["Remembered facts:"]
+        lines = [header]
         for key in order:
             joined = "; ".join(groups[key])
             lines.append(f"{key}: {joined}" if key else f"- {joined}")
     else:
-        lines = ["Remembered facts:"]
+        lines = [header]
         for mem in memories:
             subject_str = f"[{mem['subject']}] " if mem.get('subject') else ""
             lines.append(f"- {subject_str}{mem['content']}")
-
-    if token_budget is not None:
-        # Greedy pack in salience (tier) order: header + at least one fact,
-        # then facts until the budget is spent.
-        packed = [lines[0]]
-        used = estimate_tokens(lines[0])
-        for i, line in enumerate(lines[1:]):
-            cost = estimate_tokens(line)
-            if i > 0 and used + cost > token_budget:
-                break
-            packed.append(line)
-            used += cost
-        lines = packed
 
     return _redact_text("\n".join(lines))
 

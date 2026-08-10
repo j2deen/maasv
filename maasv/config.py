@@ -55,6 +55,15 @@ class MaasvConfig:
     # lexically-closer vector matches. 0.0 = legacy flat agreement bonus.
     rrf_rank_weight: float = 0.15
 
+    # Fusion rescue: candidates with NO vector-search presence (graph/BM25-only
+    # hits — e.g. multi-hop PPR results lexically far from the query) sort after
+    # every vector candidate, so on corpora larger than the vector window they
+    # can never reach the top-k. Candidates ranking in the top N of the graph
+    # or BM25 signal claim up to fusion_rescue_slots tail slots of the result
+    # (strongest fused score first). top_n=0 or slots=0 disables.
+    fusion_rescue_top_n: int = 5
+    fusion_rescue_slots: int = 2
+
     # Cross-encoder reranking (opt-in: requires sentence-transformers + torch ~2GB)
     cross_encoder_enabled: bool = False
     cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"

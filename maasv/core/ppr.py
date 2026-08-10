@@ -40,7 +40,10 @@ def build_subgraph(
         if not frontier or len(nodes) >= max_nodes:
             break
         placeholders = ",".join("?" * len(frontier))
-        params = list(frontier) * 2
+        # Sorted params: set iteration is hash-seed-randomized across
+        # processes, and parameter order changes SQL row order -> edge order
+        # -> float summation order in PageRank -> near-tie ranks flip.
+        params = sorted(frontier) * 2
         try:
             rows = db.execute(f"""
                 SELECT subject_id, object_id, confidence
@@ -73,6 +76,12 @@ def build_subgraph(
         nodes |= next_frontier
         frontier = next_frontier
 
+    # Keep the edge set closed over admitted nodes: when the max_nodes cap
+    # trims the frontier, edges collected this hop may reference endpoints
+    # that were never admitted — PageRank would push mass to (and KeyError
+    # on) nodes it doesn't track.
+    edges = [(a, b, w) for a, b, w in edges if a in nodes and b in nodes]
+
     return nodes, edges
 
 
@@ -97,29 +106,37 @@ def personalized_pagerank(
     if not nodes:
         return {}
 
-    # Undirected weighted adjacency
+    # Canonical node order: every dict below is built and iterated in sorted
+    # order so floating-point accumulation order (and therefore near-tie
+    # rankings) is identical regardless of hash-seed set iteration.
+    ordered_nodes = sorted(nodes)
+
+    # Undirected weighted adjacency (defensive membership guard: build_subgraph
+    # already closes edges over nodes, but a KeyError here would take down the
+    # whole retrieval call)
     neighbors: dict[str, list[tuple[str, float]]] = defaultdict(list)
-    for a, b, w in edges:
-        if w <= 0.0:
+    for a, b, w in sorted(edges):
+        if w <= 0.0 or a not in nodes or b not in nodes:
             continue
         neighbors[a].append((b, w))
         neighbors[b].append((a, w))
 
-    weight_sum = {n: sum(w for _, w in neighbors[n]) for n in nodes}
+    weight_sum = {n: sum(w for _, w in neighbors[n]) for n in ordered_nodes}
 
-    seeds_in_graph = [s for s in seed_ids if s in nodes]
+    seeds_in_graph = sorted(s for s in set(seed_ids) if s in nodes)
     if not seeds_in_graph:
         return {}
     restart = 1.0 / len(seeds_in_graph)
 
-    scores = {n: 0.0 for n in nodes}
+    scores = {n: 0.0 for n in ordered_nodes}
     for s in seeds_in_graph:
         scores[s] = restart
 
     for _ in range(iterations):
-        nxt = {n: 0.0 for n in nodes}
+        nxt = {n: 0.0 for n in ordered_nodes}
         dangling_mass = 0.0
-        for n, score in scores.items():
+        for n in ordered_nodes:
+            score = scores[n]
             if score == 0.0:
                 continue
             out = weight_sum.get(n, 0.0)
@@ -135,7 +152,7 @@ def personalized_pagerank(
         for s in seeds_in_graph:
             nxt[s] += per_seed
         # Convergence check (L1)
-        delta = sum(abs(nxt[n] - scores[n]) for n in nodes)
+        delta = sum(abs(nxt[n] - scores[n]) for n in ordered_nodes)
         scores = nxt
         if delta < 1e-6:
             break
