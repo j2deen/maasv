@@ -39,7 +39,8 @@ class TestEvalHarness:
         # (PPR + bucket-agnostic fusion rescue + diversity selection).
         # Deterministic corpus, so equality floors are safe.
         assert metrics["retrieval"]["recall_at_5"] == 1.0
-        assert metrics["retrieval"]["mrr"] >= 0.6
+        assert metrics["retrieval"]["recall_at_1"] >= 0.6
+        assert metrics["retrieval"]["mrr"] >= 0.8
         assert metrics["retrieval_by_type"]["graph_2hop"]["recall_at_5"] == 1.0
         # Token efficiency: retrieval must stay far below the control arm
         assert metrics["retrieval"]["mean_tokens"] < metrics["full_context"]["mean_tokens"] / 10

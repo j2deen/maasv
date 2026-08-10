@@ -68,6 +68,18 @@ class MaasvConfig:
     fusion_rescue_top_n: int = 5
     fusion_rescue_slots: int = 2
 
+    # Final reorder of the SELECTED top-k (heuristic path only — the
+    # cross-encoder owns ordering when enabled). Selection guarantees
+    # relevance; within the k, fused multi-signal strength and query-term
+    # overlap order better than raw vector similarity, which lets one-signal
+    # lexical near-misses steal rank 1. Weights: vector sim / normalized
+    # fused RRF / query-term overlap. rerank_selected=False restores the
+    # importance-score order.
+    rerank_selected: bool = True
+    rerank_selected_wv: float = 0.25
+    rerank_selected_wr: float = 2.0
+    rerank_selected_wq: float = 1.0
+
     # Cross-encoder reranking (opt-in: requires sentence-transformers + torch ~2GB)
     cross_encoder_enabled: bool = False
     cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"

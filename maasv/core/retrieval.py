@@ -140,6 +140,15 @@ def _redact_memories(memories: list[dict]) -> list[dict]:
     return redacted
 
 
+# Stop words excluded from query-term overlap in the selected-set reorder:
+# articles/prepositions plus question scaffolding that carries no content.
+_RERANK_STOP_WORDS = {
+    "the", "a", "an", "is", "of", "in", "on", "for", "and", "or", "to",
+    "with", "who", "what", "which", "why", "where", "when", "how",
+    "does", "did", "do", "s",
+}
+
+
 # ============================================================================
 # MULTI-SIGNAL RETRIEVAL HELPERS
 # ============================================================================
@@ -235,9 +244,14 @@ def _find_memories_by_bm25(db, query: str, limit: int = 50) -> list[dict]:
     query = _sanitize_fts_input(query)
     if not query:
         return []
-    expanded_query = _expand_query_from_graph(db, query)
-    if expanded_query != query:
-        logger.debug("BM25 query expanded: %s -> %s", query, expanded_query)
+    # OR-ify: FTS5 defaults to AND between terms, so a natural-language query
+    # ("Why did the Beacon launch slip") would require EVERY word in one
+    # memory and match nothing. OR + bm25 ranking scores partial matches.
+    or_query = _query_to_entity_fts(query)
+    expanded_query = _expand_query_from_graph(db, or_query)
+    if expanded_query != or_query:
+        logger.debug("BM25 query expanded: %s -> %s", or_query, expanded_query)
+    query = or_query
 
     try:
         rows = db.execute("""
@@ -969,6 +983,35 @@ def find_similar_memories(
             )
             for i, cand in enumerate(eligible[:rescue_slots]):
                 result[-(i + 1)] = cand
+
+        # === Selected-set reorder (heuristic path) ===
+        # Within the selected k, order by fused evidence rather than vector
+        # similarity: rescue puts strong multi-hop hits at the tail, and
+        # one-signal lexical near-misses otherwise hold rank 1 over golds
+        # with two signals and higher query overlap. CE, when enabled,
+        # already reorders — don't fight it.
+        if ce_scores is None and config.rerank_selected and len(result) > 1:
+            query_terms = {
+                t for t in re.findall(r'[a-z0-9]+', query.lower())
+                if t not in _RERANK_STOP_WORDS
+            }
+            # Perfect tri-signal rank-0 RRF for normalization
+            rrf_ceiling = 3.0 / 61.0
+
+            def _evidence(mem: dict) -> float:
+                dist = mem.get('distance')
+                vec_sim = 1.0 - (dist * dist) / 2.0 if dist is not None else 0.0
+                rrf_norm = (mem.get('rrf_score') or 0.0) / rrf_ceiling
+                if query_terms:
+                    content_words = set(re.findall(r'[a-z0-9]+', (mem.get('content') or '').lower()))
+                    overlap = len(query_terms & content_words) / len(query_terms)
+                else:
+                    overlap = 0.0
+                return (config.rerank_selected_wv * vec_sim
+                        + config.rerank_selected_wr * rrf_norm
+                        + config.rerank_selected_wq * overlap)
+
+            result.sort(key=lambda m: (-_evidence(m), m['id']))
 
         # Clean up internal scoring fields, expose relevance
         for mem in result:
