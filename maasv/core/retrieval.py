@@ -576,7 +576,10 @@ def _find_memories_by_graph(db, query: str, limit: int = 50) -> list[dict]:
     return fts_results
 
 
-def _find_memories_by_ppr(db, query: str, limit: int = 50) -> list[dict]:
+def _find_memories_by_ppr(
+    db, query: str, limit: int = 50,
+    entity_scores_out: Optional[dict] = None,
+) -> list[dict]:
     """
     Graph signal via Personalized PageRank (multi-hop).
 
@@ -589,6 +592,8 @@ def _find_memories_by_ppr(db, query: str, limit: int = 50) -> list[dict]:
     4. Memories ranked by accumulated score
 
     Returns dicts with 'id' (required for RRF) and 'graph_score' (0..1).
+    If entity_scores_out is given, it is filled with {entity_name: ppr_score}
+    for the query's graph neighborhood (used by the selected-set reorder).
     """
     import maasv
     config = maasv.get_config()
@@ -632,6 +637,10 @@ def _find_memories_by_ppr(db, query: str, limit: int = 50) -> list[dict]:
         f"SELECT id, name FROM entities WHERE id IN ({placeholders})", scored_ids
     ).fetchall()
     entity_names = {r["id"]: r["name"] for r in name_rows if r["name"]}
+
+    if entity_scores_out is not None:
+        for eid, name in entity_names.items():
+            entity_scores_out[name] = scores[eid]
 
     mem_scores: dict[str, float] = {}
     mem_rows: dict[str, dict] = {}
@@ -789,8 +798,12 @@ def find_similar_memories(
         bm25_results = _find_memories_by_bm25(db, query, limit=RETRIEVAL_DEPTH)
 
         # === Signal 3: Graph connectivity ===
+        query_entity_scores: dict = {}
         if maasv.get_config().graph_retrieval == "ppr":
-            graph_results = _find_memories_by_ppr(db, query, limit=RETRIEVAL_DEPTH)
+            graph_results = _find_memories_by_ppr(
+                db, query, limit=RETRIEVAL_DEPTH,
+                entity_scores_out=query_entity_scores,
+            )
             if not graph_results:
                 # Sparse/empty graph — legacy expansion still catches subject matches
                 graph_results = _find_memories_by_graph(db, query, limit=RETRIEVAL_DEPTH)
@@ -991,8 +1004,9 @@ def find_similar_memories(
         # with two signals and higher query overlap. CE, when enabled,
         # already reorders — don't fight it.
         if ce_scores is None and config.rerank_selected and len(result) > 1:
+            query_lower = query.lower()
             query_terms = {
-                t for t in re.findall(r'[a-z0-9]+', query.lower())
+                t for t in re.findall(r'[a-z0-9]+', query_lower)
                 if t not in _RERANK_STOP_WORDS
             }
             # Perfect tri-signal rank-0 RRF for normalization
@@ -1002,14 +1016,28 @@ def find_similar_memories(
                 dist = mem.get('distance')
                 vec_sim = 1.0 - (dist * dist) / 2.0 if dist is not None else 0.0
                 rrf_norm = (mem.get('rrf_score') or 0.0) / rrf_ceiling
+                content_lower = (mem.get('content') or '').lower()
                 if query_terms:
-                    content_words = set(re.findall(r'[a-z0-9]+', (mem.get('content') or '').lower()))
+                    content_words = set(re.findall(r'[a-z0-9]+', content_lower))
                     overlap = len(query_terms & content_words) / len(query_terms)
                 else:
                     overlap = 0.0
+                # Entity novelty: for relational questions the answer memory
+                # mentions graph neighbors NOT in the query; bridge facts
+                # echo the queried entity back.
+                novel_ent = known_ent = 0.0
+                for name, score in query_entity_scores.items():
+                    name_l = name.lower()
+                    if name_l and name_l in content_lower:
+                        if name_l in query_lower:
+                            known_ent += score
+                        else:
+                            novel_ent += score
                 return (config.rerank_selected_wv * vec_sim
                         + config.rerank_selected_wr * rrf_norm
-                        + config.rerank_selected_wq * overlap)
+                        + config.rerank_selected_wq * overlap
+                        + config.rerank_selected_wn * novel_ent
+                        - config.rerank_selected_wk * known_ent)
 
             result.sort(key=lambda m: (-_evidence(m), m['id']))
 

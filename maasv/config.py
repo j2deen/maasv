@@ -79,6 +79,13 @@ class MaasvConfig:
     rerank_selected_wv: float = 0.25
     rerank_selected_wr: float = 2.0
     rerank_selected_wq: float = 1.0
+    # Entity novelty (multi-hop answer detection): a memory mentioning
+    # graph-relevant entities ABSENT from the query text likely carries the
+    # answer; one restating the queried entity is likely a bridge fact
+    # echoing the question. wn rewards novel entity mass, wk penalizes
+    # known (query-mentioned) entity mass.
+    rerank_selected_wn: float = 1.0
+    rerank_selected_wk: float = 0.5
 
     # Cross-encoder reranking (opt-in: requires sentence-transformers + torch ~2GB)
     cross_encoder_enabled: bool = False
