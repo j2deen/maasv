@@ -4,7 +4,7 @@ maasv MCP Server
 Exposes the maasv cognition layer to any MCP client (Claude Desktop, Claude Code,
 ChatGPT, etc.) via the Model Context Protocol.
 
-19 tools across 4 domains:
+20 tools across 4 domains:
 - Memory (6): bootstrap, query, store, facts, forget, supersede
 - Graph (9): entity create/get/search/find_or_create/profile,
              relationship add/expire/update, graph query

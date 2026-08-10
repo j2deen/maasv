@@ -17,8 +17,10 @@ from maasv.config import MaasvConfig
 
 
 # -- Step 0: Implement the two provider protocols ---------------------------
-# maasv doesn't bundle an LLM or embedding model. You bring your own.
-# These mocks let you run the example without any external dependencies.
+# maasv doesn't bundle an LLM (and it's optional — only extraction, inference,
+# and review need one). Embeddings default to the built-in Ollama provider,
+# or you implement EmbedProvider yourself. These mocks let you run the example
+# without any external dependencies (no Ollama, no API keys).
 
 class LocalEmbedProvider:
     """Hash-based embeddings for demo purposes. Not useful for real retrieval."""
