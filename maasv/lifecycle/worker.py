@@ -22,6 +22,7 @@ class JobType(Enum):
     REORGANIZE = "reorganize"
     MEMORY_HYGIENE = "memory_hygiene"
     LEARN = "learn"
+    EVOLVE = "evolve"
 
 
 @dataclass
@@ -147,6 +148,9 @@ class SleepWorker:
             elif job.job_type == JobType.LEARN:
                 from maasv.lifecycle.learn import run_learn_job
                 run_learn_job(job.data, cancel_check=self.is_cancelled)
+            elif job.job_type == JobType.EVOLVE:
+                from maasv.lifecycle.evolve import run_evolve_job
+                run_evolve_job(job.data, cancel_check=self.is_cancelled)
 
             elapsed = time.time() - start
             logger.info(f"[Sleep] Completed {job.job_type.value} job in {elapsed:.1f}s")

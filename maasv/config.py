@@ -63,6 +63,14 @@ class MaasvConfig:
     idle_threshold_seconds: int = 30
     idle_check_interval: int = 5
 
+    # Memory evolution (A-MEM style): new memories link to related older ones
+    # during sleep-time; optionally the LLM re-tags the older side.
+    evolve_enabled: bool = True
+    evolve_link_threshold: float = 0.70  # cosine floor for a link (below dedup's 0.95)
+    evolve_max_links: int = 10           # bound on related_ids per memory (and KNN k)
+    evolve_batch_size: int = 100         # new memories per run
+    evolve_llm_refresh: bool = False     # LLM tag refresh of linked older memories
+
     # Learned ranker
     learned_ranker_enabled: bool = True
     learned_ranker_min_samples: int = 100
