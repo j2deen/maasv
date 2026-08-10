@@ -7,7 +7,7 @@ No hardcoded values in the rest of the package.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -99,6 +99,14 @@ class MaasvConfig:
 
     # Action type groupings for wisdom "similar enough" matching
     action_families: dict[str, list[str]] = field(default_factory=dict)
+
+    # Output redaction hook for sensitivity-split deployments: applied to
+    # memory content/subject at the retrieval boundary (find_similar_memories,
+    # get_tiered_memory_context, search_fts, find_by_subject) — the text that
+    # leaves maasv toward an LLM prompt. Stored data is never modified. Wire a
+    # PII scrubber (e.g. Presidio) here and cloud models only ever see
+    # redacted facts while local extraction sees raw text.
+    redact_output: Optional[Callable[[str], str]] = None
 
     # Category priority for tiered memory context (lower = higher priority)
     category_priority: dict[str, int] = field(default_factory=lambda: {

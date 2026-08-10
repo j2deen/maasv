@@ -111,6 +111,35 @@ def _importance_score(
     return primary, supplementary
 
 
+def _redact_text(text: Optional[str]) -> Optional[str]:
+    """Apply the configured output-redaction hook to one string (if any)."""
+    if text is None:
+        return None
+    import maasv
+    redact = maasv.get_config().redact_output
+    if redact is None:
+        return text
+    try:
+        return redact(text)
+    except Exception:
+        logger.warning("redact_output hook raised; withholding text", exc_info=True)
+        return "[redacted]"
+
+
+def _redact_memories(memories: list[dict]) -> list[dict]:
+    """Redact content/subject on COPIES — never mutates cached/stored rows."""
+    import maasv
+    if maasv.get_config().redact_output is None:
+        return memories
+    redacted = []
+    for mem in memories:
+        m = dict(mem)
+        m["content"] = _redact_text(m.get("content"))
+        m["subject"] = _redact_text(m.get("subject"))
+        redacted.append(m)
+    return redacted
+
+
 # ============================================================================
 # MULTI-SIGNAL RETRIEVAL HELPERS
 # ============================================================================
@@ -944,7 +973,7 @@ def find_similar_memories(
         except Exception:
             pass
 
-    return result
+    return _redact_memories(result)
 
 
 # ============================================================================
@@ -1081,7 +1110,7 @@ def get_tiered_memory_context(
         subject_str = f"[{mem['subject']}] " if mem.get('subject') else ""
         lines.append(f"- {subject_str}{mem['content']}")
 
-    return "\n".join(lines)
+    return _redact_text("\n".join(lines))
 
 
 # ============================================================================
@@ -1127,7 +1156,7 @@ def search_fts(query: str, limit: int = 10, category: Optional[str] = None) -> l
             logger.debug("FTS5 query failed (bad syntax?): %s", query, exc_info=True)
             return []
 
-    return [dict(row) for row in rows]
+    return _redact_memories([dict(row) for row in rows])
 
 
 def find_by_subject(subject: str, active_only: bool = True) -> list[dict]:
@@ -1145,4 +1174,4 @@ def find_by_subject(subject: str, active_only: bool = True) -> list[dict]:
     with _db() as db:
         rows = db.execute(query, (f"%{escaped}%",)).fetchall()
 
-    return [dict(row) for row in rows]
+    return _redact_memories([dict(row) for row in rows])

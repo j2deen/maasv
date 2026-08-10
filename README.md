@@ -207,6 +207,42 @@ config = MaasvConfig(
 
 See `maasv/config.py` for the full list, including learned ranker training and graduation thresholds.
 
+## Privacy: sensitivity-split routing
+
+maasv is built for setups where the memory corpus contains things that must never leave the machine — desktop context, enterprise records, family details. Everything lives in one local SQLite file, and two hooks make the hybrid local+cloud pattern work. The principle: **split by sensitivity, not by capability**.
+
+**1. Route LLM work by task.** Your `LLMProvider.call()` receives a per-task model name (`extraction_model`, `inference_model`, `review_model` — all just strings you configure). Point extraction and inference — the tasks that see raw conversation text — at a local model, and let a frontier model handle only whatever your agent does with retrieved facts:
+
+```python
+class SplitProvider:
+    def call(self, messages, model, max_tokens, source=""):
+        if model.startswith("ollama/"):
+            return call_ollama(messages, model.removeprefix("ollama/"), max_tokens)
+        return call_cloud(messages, model, max_tokens)
+
+config = MaasvConfig(
+    db_path=Path("memory.db"),
+    extraction_model="ollama/qwen3:8b",   # raw text stays local
+    inference_model="ollama/qwen3:8b",    # raw text stays local
+    review_model="ollama/qwen3:8b",       # raw text stays local
+)
+```
+
+With this config, no raw conversation content is ever sent to a cloud API by maasv itself.
+
+**2. Redact at the retrieval boundary.** `redact_output` is a callback applied to memory content the moment it leaves maasv toward a prompt (`find_similar_memories`, `get_tiered_memory_context`, `search_fts`, `find_by_subject`). Stored data is never modified — only the outbound copy. Wire in any scrubber; [Microsoft Presidio](https://microsoft.github.io/presidio/) is the standard open-source choice:
+
+```python
+config = MaasvConfig(
+    db_path=Path("memory.db"),
+    redact_output=lambda text: presidio_anonymize(text),  # or your own regex scrubber
+)
+```
+
+If the hook raises, maasv fails closed: the text is replaced with `[redacted]` rather than passed through.
+
+Combined, the cloud model only ever sees redacted, already-extracted facts — never the corpus, never raw conversations.
+
 ## Servers
 
 You don't have to embed maasv as a library — it also ships two servers (both optional extras).
