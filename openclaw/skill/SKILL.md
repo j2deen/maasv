@@ -43,7 +43,10 @@ openclaw plugins install @maev-ai/evolving-agents
         hooks: {
           allowConversationAccess: true,
           allowPromptInjection: true,
-          timeoutMs: 180000
+          timeouts: {
+            before_agent_start: 10000,
+            agent_end: 180000
+          }
         },
         config: {
           serverUrl: "http://127.0.0.1:18790",

@@ -39,7 +39,10 @@ openclaw plugins install @maev-ai/evolving-agents
         hooks: {
           allowConversationAccess: true, // agent_end may read the conversation (auto-capture)
           allowPromptInjection: true,    // before_agent_start may prepend memory context (auto-recall)
-          timeoutMs: 180000              // entity extraction can exceed the default hook timeout
+          timeouts: {
+            before_agent_start: 10000,   // recall must never stall a live turn
+            agent_end: 180000            // extraction may take a while on local models
+          }
         },
         config: {
           serverUrl: "http://127.0.0.1:18790",
