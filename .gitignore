@@ -30,3 +30,4 @@ venv/
 
 # Project-specific
 .enrich_checkpoint.json
+dist/

@@ -20,7 +20,7 @@ import threading
 from maev.config import MaevConfig
 from maev.protocols import LLMProvider, EmbedProvider
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _log = logging.getLogger(__name__)
 

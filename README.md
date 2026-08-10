@@ -99,7 +99,7 @@ then = get_entity_relationships(alice, as_of="2026-06-01T00:00:00+00:00")
 timeline = get_relationship_history(alice, predicate="works_at")
 ```
 
-See [`examples/quickstart.py`](examples/quickstart.py) for a complete runnable example with mock providers.
+See [`examples/quickstart.py`](https://github.com/j2deen/maev/blob/main/examples/quickstart.py) for a complete runnable example with mock providers.
 
 ## Architecture
 
@@ -301,7 +301,7 @@ maev-server                           # defaults to 127.0.0.1:18790
 
 Both configure via `MAEV_`-prefixed environment variables (or a `.env` file): `MAEV_DB_PATH`, `MAEV_LLM_PROVIDER` (`anthropic` or `openai`), `MAEV_LLM_API_KEY`, `MAEV_EMBED_PROVIDER` (`ollama`, `voyage`, or `openai`), and friends. Since the servers own the process, they construct providers for you from those variables — this is where the `anthropic`, `openai`, and `voyage` extras come in.
 
-**OpenClaw plugin** ([`openclaw/`](openclaw/)) gives [OpenClaw](https://openclaw.ai) agents maev-backed long-term memory through the REST server: auto-recall injects tiered memory context before each agent turn, auto-capture runs extraction after each conversation, and the agent gets `memory_search` / `memory_store` / `memory_forget` plus optional graph and wisdom tools. The plugin is the MAEV continuation of Adam Bell's `openclaw-maasv`, vendored here so engine and plugin ship as a single artifact — see [`openclaw/README.md`](openclaw/README.md) for setup.
+**OpenClaw plugin** ([`openclaw/`](https://github.com/j2deen/maev/blob/main/openclaw/)) gives [OpenClaw](https://openclaw.ai) agents maev-backed long-term memory through the REST server: auto-recall injects tiered memory context before each agent turn, auto-capture runs extraction after each conversation, and the agent gets `memory_search` / `memory_store` / `memory_forget` plus optional graph and wisdom tools. The plugin is the MAEV continuation of Adam Bell's `openclaw-maasv`, vendored here so engine and plugin ship as a single artifact — see [`openclaw/README.md`](https://github.com/j2deen/maev/blob/main/openclaw/README.md) for setup.
 
 ## Evals
 
@@ -320,7 +320,7 @@ Active development. The core concepts (memory, graph, retrieval, wisdom, lifecyc
 
 ## License
 
-Business Source License 1.1, inherited from the original maasv work — the LICENSE file is preserved unmodified, including the original licensor. Free for personal, internal, educational, and non-commercial use. Commercial use of the original work requires a license from the original licensor (admin@maasv.ai, per the LICENSE). Converts to Apache 2.0 on 2030-02-16. See [LICENSE](LICENSE) for details.
+Business Source License 1.1, inherited from the original maasv work — the LICENSE file is preserved unmodified, including the original licensor. Free for personal, internal, educational, and non-commercial use. Commercial use of the original work requires a license from the original licensor (admin@maasv.ai, per the LICENSE). Converts to Apache 2.0 on 2030-02-16. See [LICENSE](https://github.com/j2deen/maev/blob/main/LICENSE) for details.
 
 ## Related
 
