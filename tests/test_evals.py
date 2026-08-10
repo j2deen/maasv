@@ -29,9 +29,10 @@ class TestEvalHarness:
         assert metrics["full_context"]["mean_tokens"] > metrics["retrieval"]["mean_tokens"]
 
     def test_regression_floors(self, metrics):
-        # Loose floors: catch pipeline breakage, not tuning noise
-        assert metrics["retrieval"]["recall_at_5"] >= 0.7
+        # Floors lock in the PPR + RRF-strength gains; deterministic corpus
+        assert metrics["retrieval"]["recall_at_5"] >= 0.9
         assert metrics["retrieval_by_type"]["keyword"]["recall_at_5"] == 1.0
+        assert metrics["retrieval_by_type"]["graph_2hop"]["recall_at_5"] == 1.0
 
     def test_report_renders(self, metrics):
         report = format_report(metrics)

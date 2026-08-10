@@ -42,6 +42,19 @@ class MaasvConfig:
     diversity_threshold: float = 0.0  # Jaccard threshold for dedup (0.0 = disabled, 0.7 = moderate)
     graph_slot_injection: bool = False  # Force-inject a graph result into last slot
 
+    # Graph retrieval signal: "ppr" (Personalized PageRank, multi-hop; falls back
+    # to one_hop when the graph yields nothing) or "one_hop" (legacy expansion)
+    graph_retrieval: str = "ppr"
+    ppr_alpha: float = 0.5        # walk-continuation probability (1-alpha restarts at seeds)
+    ppr_iterations: int = 20      # power-iteration cap (converges early via L1 check)
+    ppr_max_nodes: int = 500      # BFS subgraph bound
+    ppr_top_entities: int = 12    # entities mapped back to memories
+
+    # Weight of the normalized RRF fused score in final ranking. Lets a memory
+    # that ranks highly in BM25/graph (e.g. multi-hop PPR hits) compete with
+    # lexically-closer vector matches. 0.0 = legacy flat agreement bonus.
+    rrf_rank_weight: float = 0.15
+
     # Cross-encoder reranking (opt-in: requires sentence-transformers + torch ~2GB)
     cross_encoder_enabled: bool = False
     cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"

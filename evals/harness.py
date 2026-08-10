@@ -57,6 +57,16 @@ def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = Non
     for subj, pred, obj in corpus.relationships:
         add_relationship(entity_ids[subj], pred, object_id=entity_ids[obj])
 
+    # Pin every timestamp to one instant: created_at ties and decay factors are
+    # then identical run-to-run, so evals can't flake on second boundaries.
+    from maasv.core.db import _db as _db_ctx
+    frozen = "2026-01-01 00:00:00"
+    with _db_ctx() as db:
+        db.execute("UPDATE memories SET created_at=?, updated_at=?, ingested_at=?", (frozen,) * 3)
+        db.execute("UPDATE relationships SET created_at=?, valid_from=?, ingested_at=?", (frozen,) * 3)
+        db.execute("UPDATE entities SET created_at=?, updated_at=?", (frozen,) * 2)
+        db.commit()
+
     get_core_memories(refresh=True)  # bust module-level cache from prior runs
     return key_to_id
 

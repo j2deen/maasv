@@ -35,16 +35,24 @@ def _importance_score(
     vector_distances: dict[str, float],
     bm25_ids: set[str],
     graph_ids: set[str],
+    rrf_weight: float = 0.0,
 ) -> tuple[list[dict], list[dict]]:
     """
     Score candidates by importance-weighted formula. Separates into primary
     (have vector distance) and supplementary (no vector distance) lists,
     both sorted by _imp_score descending.
 
-    Scoring: (1 - distance) + 0.05 * importance * decay * ips_utility + agreement_bonus
+    Scoring: (1 - distance) + 0.05 * importance * decay * ips_utility + signal term.
+    The signal term is rrf_weight * normalized fused RRF score when rrf_weight > 0
+    (signal STRENGTH — a rank-1 graph or BM25 hit carries real weight), else the
+    legacy flat agreement bonus (signal membership only).
     """
     primary = []
     supplementary = []
+
+    max_rrf = 0.0
+    if rrf_weight > 0.0:
+        max_rrf = max((m.get("rrf_score") or 0.0 for m in candidates), default=0.0)
 
     for mem in candidates:
         importance = mem.get('importance') or 0.5
@@ -73,22 +81,28 @@ def _importance_score(
 
         distance = vector_distances.get(mem['id'])
 
+        if rrf_weight > 0.0 and max_rrf > 0.0:
+            signal_term = rrf_weight * (mem.get("rrf_score") or 0.0) / max_rrf
+        else:
+            signal_count = 1
+            if mem['id'] in bm25_ids:
+                signal_count += 1
+            if mem['id'] in graph_ids:
+                signal_count += 1
+            signal_term = (signal_count - 1) * 0.03
+
         if distance is not None:
             # Vector similarity is the primary signal. Importance, decay, and
             # usage are additive tiebreakers — they influence ordering among
             # close matches but can't override a strong vector match.
             vector_sim = 1.0 - distance
             tiebreaker = 0.05 * importance * decay_factor * ips_utility
-            signal_count = 1
-            if mem['id'] in bm25_ids:
-                signal_count += 1
-            if mem['id'] in graph_ids:
-                signal_count += 1
-            agreement_bonus = (signal_count - 1) * 0.03
-            mem['_imp_score'] = vector_sim + tiebreaker + agreement_bonus
+            mem['_imp_score'] = vector_sim + tiebreaker + signal_term
             primary.append(mem)
         else:
-            mem['_imp_score'] = importance * decay_factor * ips_utility * 0.0001
+            # No vector presence — fused-rank strength still earns a real score
+            # so a top BM25/graph hit isn't buried behind every vector match.
+            mem['_imp_score'] = signal_term + importance * decay_factor * ips_utility * 0.0001
             supplementary.append(mem)
 
     primary.sort(key=lambda m: m['_imp_score'], reverse=True)
@@ -519,6 +533,118 @@ def _find_memories_by_graph(db, query: str, limit: int = 50) -> list[dict]:
     return fts_results
 
 
+def _find_memories_by_ppr(db, query: str, limit: int = 50) -> list[dict]:
+    """
+    Graph signal via Personalized PageRank (multi-hop).
+
+    Flow:
+    1. Entity FTS finds seed entities matching query terms
+    2. PPR over the seed neighborhood scores every reachable entity —
+       2-hop and 3-hop entities get proportionally smaller (nonzero) weight
+    3. Top-scored entities map back to memories (content FTS + subject LIKE);
+       each memory accumulates the PPR score of every entity that matched it
+    4. Memories ranked by accumulated score
+
+    Returns dicts with 'id' (required for RRF) and 'graph_score' (0..1).
+    """
+    import maasv
+    config = maasv.get_config()
+
+    entity_fts_query = _query_to_entity_fts(query)
+    try:
+        seeds = db.execute("""
+            SELECT e.id, e.name
+            FROM entities_fts f
+            JOIN entities e ON f.rowid = e.rowid
+            WHERE entities_fts MATCH ?
+            LIMIT 10
+        """, (entity_fts_query,)).fetchall()
+    except Exception:
+        logger.debug("Entity FTS failed for PPR seeds: %s", query, exc_info=True)
+        return []
+
+    if not seeds:
+        return []
+
+    from maasv.core.ppr import personalized_pagerank
+    scores = personalized_pagerank(
+        db,
+        [s["id"] for s in seeds],
+        alpha=config.ppr_alpha,
+        iterations=config.ppr_iterations,
+        max_nodes=config.ppr_max_nodes,
+    )
+    if not scores:
+        return []
+
+    scored_ids = sorted(scores, key=lambda eid: (-scores[eid], eid))[:config.ppr_top_entities]
+    placeholders = ",".join("?" * len(scored_ids))
+    name_rows = db.execute(
+        f"SELECT id, name FROM entities WHERE id IN ({placeholders})", scored_ids
+    ).fetchall()
+    entity_names = {r["id"]: r["name"] for r in name_rows if r["name"]}
+
+    mem_scores: dict[str, float] = {}
+    mem_rows: dict[str, dict] = {}
+
+    for eid in scored_ids:
+        name = entity_names.get(eid)
+        if not name:
+            continue
+        clean = re.sub(r'[^\w\s]', '', name).strip()
+        if len(clean) < 2:
+            continue
+
+        rows: list = []
+        try:
+            rows = db.execute("""
+                SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                       m.created_at, m.metadata, m.importance, m.access_count,
+                       m.surfacing_count, m.origin, m.origin_interface
+                FROM memories_fts f
+                JOIN memories m ON f.rowid = m.rowid
+                WHERE memories_fts MATCH ?
+                AND m.superseded_by IS NULL
+                LIMIT 5
+            """, (f'"{clean}"',)).fetchall()
+        except Exception:
+            logger.debug("PPR memory FTS failed for entity: %s", name, exc_info=True)
+
+        try:
+            subject_rows = db.execute("""
+                SELECT m.id, m.content, m.category, m.subject, m.confidence,
+                       m.created_at, m.metadata, m.importance, m.access_count,
+                       m.surfacing_count, m.origin, m.origin_interface
+                FROM memories m
+                WHERE m.superseded_by IS NULL
+                AND LOWER(m.subject) LIKE ? ESCAPE '\\'
+                LIMIT 5
+            """, (f"%{_escape_like(name.lower())}%",)).fetchall()
+        except Exception:
+            subject_rows = []
+
+        matched_ids = set()
+        for row in list(rows) + list(subject_rows):
+            r = dict(row)
+            if r["id"] in matched_ids:
+                continue  # one credit per entity per memory
+            matched_ids.add(r["id"])
+            mem_scores[r["id"]] = mem_scores.get(r["id"], 0.0) + scores[eid]
+            mem_rows.setdefault(r["id"], r)
+
+    if not mem_scores:
+        return []
+
+    max_score = max(mem_scores.values())
+    ranked = sorted(mem_scores, key=lambda mid: (-mem_scores[mid], mid))[:limit]
+    results = []
+    for mid in ranked:
+        r = mem_rows[mid]
+        r["graph_score"] = mem_scores[mid] / max_score if max_score > 0 else 0.0
+        results.append(r)
+    return results
+
+
 def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], k: int = 60) -> list[dict]:
     """
     Merge multiple ranked lists using Reciprocal Rank Fusion.
@@ -614,7 +740,13 @@ def find_similar_memories(
         bm25_results = _find_memories_by_bm25(db, query, limit=RETRIEVAL_DEPTH)
 
         # === Signal 3: Graph connectivity ===
-        graph_results = _find_memories_by_graph(db, query, limit=RETRIEVAL_DEPTH)
+        if maasv.get_config().graph_retrieval == "ppr":
+            graph_results = _find_memories_by_ppr(db, query, limit=RETRIEVAL_DEPTH)
+            if not graph_results:
+                # Sparse/empty graph — legacy expansion still catches subject matches
+                graph_results = _find_memories_by_graph(db, query, limit=RETRIEVAL_DEPTH)
+        else:
+            graph_results = _find_memories_by_graph(db, query, limit=RETRIEVAL_DEPTH)
 
         # === Fusion: Reciprocal Rank Fusion ===
         signals = [vector_results, bm25_results, graph_results]
@@ -660,7 +792,8 @@ def find_similar_memories(
             primary, supplementary = lr_result
         else:
             primary, supplementary = _importance_score(
-                candidates, protected, now, vector_distances, bm25_ids, graph_ids
+                candidates, protected, now, vector_distances, bm25_ids, graph_ids,
+                rrf_weight=maasv.get_config().rrf_rank_weight,
             )
 
         if ce_scores is not None:
