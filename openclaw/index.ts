@@ -223,16 +223,36 @@ export default {
 
 // --- Helpers ---
 
+function messageContentToText(content: any): string {
+  if (typeof content === "string") return content;
+  // OpenClaw 2026.7.x uses content-block arrays: [{type:"text", text:"..."}]
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+      .map((block: any) => block.text)
+      .join("\n");
+    if (text) return text;
+  }
+  return JSON.stringify(content);
+}
+
+function resolveEventMessages(event: any): any[] | null {
+  // OpenClaw 2026.7.x: agent_end passes { messages }; older builds nested
+  // them under event.context.messages.
+  if (Array.isArray(event?.messages)) return event.messages;
+  if (Array.isArray(event?.context?.messages)) return event.context.messages;
+  return null;
+}
+
 function extractUserMessage(event: any): string | null {
-  // OpenClaw passes the user's message in various event shapes
+  // OpenClaw 2026.7.x: before_agent_start passes { prompt }
+  if (typeof event?.prompt === "string" && event.prompt.trim()) return event.prompt;
   if (typeof event?.userMessage === "string") return event.userMessage;
-  if (event?.context?.messages) {
-    const messages = event.context.messages;
+  const messages = resolveEventMessages(event);
+  if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "user") {
-        return typeof messages[i].content === "string"
-          ? messages[i].content
-          : JSON.stringify(messages[i].content);
+        return messageContentToText(messages[i].content);
       }
     }
   }
@@ -240,18 +260,14 @@ function extractUserMessage(event: any): string | null {
 }
 
 function extractConversation(event: any): string | null {
-  if (!event?.context?.messages) return null;
+  const messages = resolveEventMessages(event);
+  if (!messages) return null;
 
-  const messages = event.context.messages;
   const parts: string[] = [];
 
   for (const msg of messages) {
     if (msg.role === "user" || msg.role === "assistant") {
-      const content =
-        typeof msg.content === "string"
-          ? msg.content
-          : JSON.stringify(msg.content);
-      parts.push(`${msg.role}: ${content}`);
+      parts.push(`${msg.role}: ${messageContentToText(msg.content)}`);
     }
   }
 

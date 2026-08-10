@@ -33,7 +33,8 @@
     "openclaw.plugin.json",
     "tsconfig.json",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "dist/**"
   ],
   "publishConfig": {
     "access": "public"
@@ -43,9 +44,19 @@
   },
   "devDependencies": {
     "openclaw": "*",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "esbuild": "^0.24.0"
   },
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "esbuild index.ts --bundle --format=esm --platform=node --target=node20 --outfile=dist/index.js",
+    "prepublishOnly": "npm run build"
   }
 }
