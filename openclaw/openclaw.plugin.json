@@ -4,7 +4,9 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["serverUrl"],
+    "required": [
+      "serverUrl"
+    ],
     "properties": {
       "serverUrl": {
         "type": "string",
@@ -86,5 +88,14 @@
       "help": "Expose experiential learning tools (log reasoning, record outcomes)",
       "advanced": true
     }
+  },
+  "contracts": {
+    "tools": [
+      "memory_search",
+      "memory_store",
+      "memory_forget",
+      "memory_graph",
+      "memory_wisdom"
+    ]
   }
 }
