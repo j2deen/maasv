@@ -39,10 +39,11 @@ export class MaevClient {
     method: string,
     path: string,
     body?: unknown,
+    timeoutMs = 30_000,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30_000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     const init: RequestInit = {
       method,
@@ -111,7 +112,8 @@ export class MaevClient {
     text: string,
     topic?: string,
   ): Promise<ExtractionResult> {
-    return this.request("POST", "/v1/extract", { text, topic: topic ?? "" });
+    // LLM entity extraction can take minutes when the model cold-starts.
+    return this.request("POST", "/v1/extract", { text, topic: topic ?? "" }, 150_000);
   }
 
   // --- Graph ---
