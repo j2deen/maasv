@@ -5,20 +5,20 @@ import pytest
 
 @pytest.fixture(scope="module")
 def bt_db(tmp_path_factory):
-    from maasv.config import MaasvConfig
-    import maasv
+    from maev.config import MaevConfig
+    import maev
     from tests.test_decomposition import MockLLMProvider, MockEmbedProvider
 
     db_path = tmp_path_factory.mktemp("bitemporal_test") / "test.db"
-    config = MaasvConfig(
+    config = MaevConfig(
         db_path=db_path,
         embed_dims=64,
         extra_functional_predicates={"custom_single"},
         extra_predicates={"custom_single"},
     )
-    maasv.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
+    maev.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
 
-    from maasv.core.graph import find_or_create_entity
+    from maev.core.graph import find_or_create_entity
     return {
         "alice": find_or_create_entity("BtAlice", "person"),
         "toronto": find_or_create_entity("BtToronto", "place"),
@@ -36,7 +36,7 @@ T_AFTER = "2026-04-01T00:00:00+00:00"
 
 class TestFunctionalInvalidation:
     def test_new_fact_supersedes_old(self, bt_db):
-        from maasv.core.graph import add_relationship, get_entity_relationships, get_relationship_history
+        from maev.core.graph import add_relationship, get_entity_relationships, get_relationship_history
 
         r1 = add_relationship(bt_db["alice"], "lives_in", object_id=bt_db["toronto"], valid_from=T1)
         r2 = add_relationship(bt_db["alice"], "lives_in", object_id=bt_db["nyc"], valid_from=T2)
@@ -53,7 +53,7 @@ class TestFunctionalInvalidation:
         assert old["change_reason"] == "superseded_by_new_fact"
 
     def test_same_object_dedups_not_supersedes(self, bt_db):
-        from maasv.core.graph import add_relationship, get_relationship_history
+        from maev.core.graph import add_relationship, get_relationship_history
 
         r2a = add_relationship(bt_db["alice"], "lives_in", object_id=bt_db["nyc"], valid_from=T_AFTER)
         history = get_relationship_history(bt_db["alice"], predicate="lives_in")
@@ -62,7 +62,7 @@ class TestFunctionalInvalidation:
         assert len(active) == 1 and active[0]["id"] == r2a
 
     def test_multivalued_predicate_coexists(self, bt_db):
-        from maasv.core.graph import add_relationship, get_entity_relationships
+        from maev.core.graph import add_relationship, get_entity_relationships
 
         add_relationship(bt_db["alice"], "works_on", object_id=bt_db["atlas"], valid_from=T1)
         add_relationship(bt_db["alice"], "works_on", object_id=bt_db["beacon"], valid_from=T2)
@@ -70,7 +70,7 @@ class TestFunctionalInvalidation:
         assert len(active) == 2
 
     def test_extra_functional_predicate_from_config(self, bt_db):
-        from maasv.core.graph import add_relationship, get_entity_relationships
+        from maev.core.graph import add_relationship, get_entity_relationships
 
         add_relationship(bt_db["alice"], "custom_single", object_value="v1", valid_from=T1)
         add_relationship(bt_db["alice"], "custom_single", object_value="v2", valid_from=T2)
@@ -81,7 +81,7 @@ class TestFunctionalInvalidation:
 
 class TestAsOfQueries:
     def test_as_of_returns_past_belief(self, bt_db):
-        from maasv.core.graph import get_entity_relationships
+        from maev.core.graph import get_entity_relationships
 
         then = get_entity_relationships(
             bt_db["alice"], predicate="lives_in", direction="outgoing", as_of=T_BETWEEN
@@ -90,7 +90,7 @@ class TestAsOfQueries:
         assert then[0]["object_id"] == bt_db["toronto"]
 
     def test_as_of_boundary_semantics(self, bt_db):
-        from maasv.core.graph import get_entity_relationships
+        from maev.core.graph import get_entity_relationships
 
         # At exactly T2 the old fact is closed (valid_to > as_of fails)
         # and the new fact is valid (valid_from <= as_of holds)
@@ -101,7 +101,7 @@ class TestAsOfQueries:
         assert at_t2[0]["object_id"] == bt_db["nyc"]
 
     def test_as_of_before_any_fact(self, bt_db):
-        from maasv.core.graph import get_entity_relationships
+        from maev.core.graph import get_entity_relationships
 
         before = get_entity_relationships(
             bt_db["alice"], predicate="lives_in", direction="outgoing",
@@ -112,7 +112,7 @@ class TestAsOfQueries:
 
 class TestExpireChangeReason:
     def test_expire_records_reason(self, bt_db):
-        from maasv.core.graph import add_relationship, expire_relationship, get_relationship_history
+        from maev.core.graph import add_relationship, expire_relationship, get_relationship_history
 
         rid = add_relationship(bt_db["alice"], "uses", object_value="vim", valid_from=T1)
         assert expire_relationship(rid, change_reason="user_correction") is True
@@ -122,7 +122,7 @@ class TestExpireChangeReason:
         assert row["change_reason"] == "user_correction"
 
     def test_expire_already_expired_is_noop(self, bt_db):
-        from maasv.core.graph import add_relationship, expire_relationship
+        from maev.core.graph import add_relationship, expire_relationship
 
         rid = add_relationship(bt_db["alice"], "uses", object_value="emacs", valid_from=T1)
         assert expire_relationship(rid) is True

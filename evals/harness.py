@@ -1,4 +1,4 @@
-"""Eval harness: recall + token cost for maasv retrieval, with control arms.
+"""Eval harness: recall + token cost for maev retrieval, with control arms.
 
 Three arms per run:
 - retrieval:    find_similar_memories(query, limit=k) — the main pipeline
@@ -29,7 +29,7 @@ def approx_tokens(text: str) -> int:
 
 
 def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = None) -> dict[str, str]:
-    """Init a fresh maasv db, load the corpus. Returns memory key -> id map.
+    """Init a fresh maev db, load the corpus. Returns memory key -> id map.
 
     Memory/entity IDs are pinned to a deterministic sequence for the duration
     of corpus loading: several ranking tie-breakers fall back to the ID, and
@@ -37,8 +37,8 @@ def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = Non
     """
     import itertools
     import uuid as _uuid
-    import maasv
-    from maasv.config import MaasvConfig
+    import maev
+    from maev.config import MaevConfig
 
     kwargs = dict(
         db_path=db_path,
@@ -55,11 +55,11 @@ def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = Non
         },
     )
     kwargs.update(config_overrides or {})
-    maasv.init(config=MaasvConfig(**kwargs), llm=NullLLM(), embed=HashedBowEmbed(dims=EMBED_DIMS))
+    maev.init(config=MaevConfig(**kwargs), llm=NullLLM(), embed=HashedBowEmbed(dims=EMBED_DIMS))
 
-    from maasv.core.store import store_memory
-    from maasv.core.graph import find_or_create_entity, add_relationship
-    from maasv.core.retrieval import get_core_memories
+    from maev.core.store import store_memory
+    from maev.core.graph import find_or_create_entity, add_relationship
+    from maev.core.retrieval import get_core_memories
 
     counter = itertools.count(1)
     real_uuid4 = _uuid.uuid4
@@ -83,7 +83,7 @@ def _setup(db_path: Path, corpus: Corpus, config_overrides: Optional[dict] = Non
 
     # Pin every timestamp to one instant: created_at ties and decay factors are
     # then identical run-to-run, so evals can't flake on second boundaries.
-    from maasv.core.db import _db as _db_ctx
+    from maev.core.db import _db as _db_ctx
     frozen = "2026-01-01 00:00:00"
     with _db_ctx() as db:
         db.execute("UPDATE memories SET created_at=?, updated_at=?, ingested_at=?", (frozen,) * 3)
@@ -114,8 +114,8 @@ def run_eval(k: int = 5, config_overrides: Optional[dict] = None,
         key_to_id = _setup(Path(tmp) / "eval.db", corpus, config_overrides)
         id_to_content = {key_to_id[m.key]: m.content for m in corpus.memories}
 
-        from maasv.core.retrieval import find_similar_memories, get_tiered_memory_context
-        from maasv.core.store import get_all_active
+        from maev.core.retrieval import find_similar_memories, get_tiered_memory_context
+        from maev.core.store import get_all_active
 
         full_context_text = "\n".join(m["content"] for m in get_all_active())
         full_context_tokens = approx_tokens(full_context_text)
@@ -191,7 +191,7 @@ def format_report(metrics: dict) -> str:
     """Human-readable eval report."""
     k = metrics["k"]
     lines = [
-        f"maasv eval — {metrics['n_questions']} questions over {metrics['n_memories']} memories (k={k})",
+        f"maev eval — {metrics['n_questions']} questions over {metrics['n_memories']} memories (k={k})",
         "",
         f"{'arm / type':<22}{'R@1':>7}{'R@' + str(k):>7}{'MRR':>7}{'tokens':>9}",
         "-" * 52,

@@ -8,7 +8,7 @@ from evals.harness import run_eval, format_report
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the maasv eval harness")
+    parser = argparse.ArgumentParser(description="Run the maev eval harness")
     parser.add_argument("--k", type=int, default=5, help="retrieval depth (default 5)")
     parser.add_argument("--json", action="store_true", help="emit full metrics as JSON")
     args = parser.parse_args()

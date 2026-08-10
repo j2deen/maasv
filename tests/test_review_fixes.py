@@ -13,16 +13,16 @@ class TestPPRCapCrash:
     """Finding: edges referencing max_nodes-trimmed endpoints crashed PPR."""
 
     def test_hub_exceeding_max_nodes_does_not_crash(self, tmp_path):
-        import maasv
-        from maasv.config import MaasvConfig
+        import maev
+        from maev.config import MaevConfig
         from tests.test_decomposition import MockLLMProvider, MockEmbedProvider
 
-        config = MaasvConfig(db_path=tmp_path / "hub.db", embed_dims=64)
-        maasv.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
+        config = MaevConfig(db_path=tmp_path / "hub.db", embed_dims=64)
+        maev.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
 
-        from maasv.core.graph import find_or_create_entity, add_relationship
-        from maasv.core.db import _db
-        from maasv.core.ppr import personalized_pagerank, build_subgraph
+        from maev.core.graph import find_or_create_entity, add_relationship
+        from maev.core.db import _db
+        from maev.core.ppr import personalized_pagerank, build_subgraph
 
         hub = find_or_create_entity("HubSeed", "person")
         for i in range(12):
@@ -60,7 +60,7 @@ class TestFusionRescue:
 
         with tempfile.TemporaryDirectory() as tmp:
             key_to_id = _setup(Path(tmp) / "flood.db", corpus, None)
-            from maasv.core.retrieval import find_similar_memories
+            from maev.core.retrieval import find_similar_memories
 
             results = find_similar_memories(
                 "Who is responsible for the thing that depends on Postgres?", limit=5
@@ -74,17 +74,17 @@ class TestBitemporalBackfill:
 
     @pytest.fixture()
     def bf_db(self, tmp_path):
-        import maasv
-        from maasv.config import MaasvConfig
+        import maev
+        from maev.config import MaevConfig
         from tests.test_decomposition import MockLLMProvider, MockEmbedProvider
 
-        config = MaasvConfig(db_path=tmp_path / "bf.db", embed_dims=64)
-        maasv.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
-        from maasv.core.graph import find_or_create_entity
+        config = MaevConfig(db_path=tmp_path / "bf.db", embed_dims=64)
+        maev.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
+        from maev.core.graph import find_or_create_entity
         return find_or_create_entity("BfAlice", "person")
 
     def test_backfill_keeps_current_fact_active(self, bf_db):
-        from maasv.core.graph import (
+        from maev.core.graph import (
             add_relationship, get_entity_relationships, get_relationship_history,
         )
 
@@ -107,7 +107,7 @@ class TestBitemporalBackfill:
         assert nyc["valid_to"] is None  # no negative interval
 
     def test_as_of_correct_after_backfill(self, bf_db):
-        from maasv.core.graph import add_relationship, get_entity_relationships
+        from maev.core.graph import add_relationship, get_entity_relationships
 
         add_relationship(bf_db, "lives_in", object_value="NYC",
                          valid_from="2026-06-01T00:00:00+00:00")
@@ -128,15 +128,15 @@ class TestBitemporalBackfill:
 class TestEvolveFixes:
     def test_tag_refresh_preserves_backlink(self, tmp_path):
         """Finding: _refresh_tags wrote stale metadata, erasing related_ids."""
-        import maasv
-        from maasv.config import MaasvConfig
-        from maasv.core.store import store_memory
-        from maasv.lifecycle.evolve import run_evolve_job
+        import maev
+        from maev.config import MaevConfig
+        from maev.core.store import store_memory
+        from maev.lifecycle.evolve import run_evolve_job
         from tests.test_evolve import ClusterEmbed, TagLLM, _set_created, _get_meta
 
-        config = MaasvConfig(db_path=tmp_path / "tagfix.db", embed_dims=64,
+        config = MaevConfig(db_path=tmp_path / "tagfix.db", embed_dims=64,
                              evolve_llm_refresh=True)
-        maasv.init(config=config, llm=TagLLM(), embed=ClusterEmbed(dims=64))
+        maev.init(config=config, llm=TagLLM(), embed=ClusterEmbed(dims=64))
 
         a1 = store_memory("The planet Mercury is closest to the sun", category="learning")
         a2 = store_memory("The planet Neptune is farthest out", category="learning")
@@ -151,16 +151,16 @@ class TestEvolveFixes:
 
     def test_same_second_memories_all_processed(self, tmp_path):
         """Finding: timestamp-only watermark skipped same-second rows forever."""
-        import maasv
-        from maasv.config import MaasvConfig
-        from maasv.core.store import store_memory
-        from maasv.lifecycle.evolve import run_evolve_job
+        import maev
+        from maev.config import MaevConfig
+        from maev.core.store import store_memory
+        from maev.lifecycle.evolve import run_evolve_job
         from tests.test_evolve import ClusterEmbed, _set_created
         from tests.test_decomposition import MockLLMProvider
 
-        config = MaasvConfig(db_path=tmp_path / "wm.db", embed_dims=64,
+        config = MaevConfig(db_path=tmp_path / "wm.db", embed_dims=64,
                              evolve_batch_size=2)
-        maasv.init(config=config, llm=MockLLMProvider(), embed=ClusterEmbed(dims=64))
+        maev.init(config=config, llm=MockLLMProvider(), embed=ClusterEmbed(dims=64))
 
         ids = [
             store_memory(f"The planet catalogue entry {i}", category="learning")
@@ -180,15 +180,15 @@ class TestCompactBudgetInteraction:
 
     @pytest.fixture()
     def cb_db(self, tmp_path):
-        import maasv
-        from maasv.config import MaasvConfig
+        import maev
+        from maev.config import MaevConfig
         from tests.test_decomposition import MockLLMProvider, MockEmbedProvider
 
-        config = MaasvConfig(db_path=tmp_path / "cb.db", embed_dims=64)
-        maasv.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
+        config = MaevConfig(db_path=tmp_path / "cb.db", embed_dims=64)
+        maev.init(config=config, llm=MockLLMProvider(), embed=MockEmbedProvider(dims=64))
 
-        from maasv.core.store import store_memory
-        from maasv.core.retrieval import get_core_memories
+        from maev.core.store import store_memory
+        from maev.core.retrieval import get_core_memories
         # All subjectless: previously merged into ONE always-included line
         store_memory("Denver offsite planning starts next month", category="history")
         for i in range(12):
@@ -197,8 +197,8 @@ class TestCompactBudgetInteraction:
         return True
 
     def test_compact_respects_budget(self, cb_db):
-        from maasv.core.retrieval import get_tiered_memory_context
-        from maasv.utils import estimate_tokens
+        from maev.core.retrieval import get_tiered_memory_context
+        from maev.utils import estimate_tokens
 
         ctx = get_tiered_memory_context(
             query="Denver offsite", token_budget=40, compact=True
@@ -207,7 +207,7 @@ class TestCompactBudgetInteraction:
         assert ctx.count("Miscellaneous") <= 2  # filler no longer rides along
 
     def test_compact_budget_equals_plain_budget_selection(self, cb_db):
-        from maasv.core.retrieval import get_tiered_memory_context
+        from maev.core.retrieval import get_tiered_memory_context
 
         plain = get_tiered_memory_context(query="Denver offsite", token_budget=40)
         compact = get_tiered_memory_context(query="Denver offsite", token_budget=40, compact=True)
