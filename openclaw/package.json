@@ -17,6 +17,27 @@
     "knowledge-graph",
     "cognition"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j2deen/maev.git",
+    "directory": "openclaw"
+  },
+  "homepage": "https://github.com/j2deen/maev/tree/main/openclaw#readme",
+  "bugs": "https://github.com/j2deen/maev/issues",
+  "files": [
+    "index.ts",
+    "client.ts",
+    "types.ts",
+    "tools/",
+    "skill/",
+    "openclaw.plugin.json",
+    "tsconfig.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"
   },
