@@ -20,9 +20,9 @@ See the [MAEV README](../README.md) for full setup details.
 
 ## Setup
 
-1. Install the plugin (it lives in this repository's `openclaw/` directory; not yet published to npm):
+1. Install the plugin from npm (or from this repository's `openclaw/` directory):
 ```bash
-openclaw plugins install /path/to/maev/openclaw
+openclaw plugins install @maev-ai/evolving-agents
 ```
 
 2. Activate the memory slot:

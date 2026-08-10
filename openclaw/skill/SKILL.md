@@ -22,10 +22,10 @@ maev-server
 
 ### 2. Install the plugin
 
-The plugin lives in this repository's `openclaw/` directory (not yet published to npm):
+Install from npm (or from this repository's `openclaw/` directory):
 
 ```bash
-openclaw plugins install /path/to/maev/openclaw
+openclaw plugins install @maev-ai/evolving-agents
 ```
 
 ### 3. Activate
@@ -83,5 +83,5 @@ The maev server needs an LLM provider (for entity extraction) and an embedding p
 
 ## Links
 
-- **Plugin:** `openclaw/` in [github.com/j2deen/maev](https://github.com/j2deen/maev) (not yet on npm)
+- **Plugin (npm):** [@maev-ai/evolving-agents](https://www.npmjs.com/package/@maev-ai/evolving-agents)
 - **Server + core:** [github.com/j2deen/maev](https://github.com/j2deen/maev) (not yet on PyPI)
