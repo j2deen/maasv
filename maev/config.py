@@ -21,10 +21,14 @@ class MaevConfig:
     embed_dims: int = 1024
     embed_model: str = "qwen3-embedding:8b"  # recorded in DB to prevent model mismatch
 
-    # Models (passed to LLMProvider.call — provider decides how to route)
-    extraction_model: str = "claude-haiku-4-5-20251001"
-    inference_model: str = "claude-haiku-4-5-20251001"
-    review_model: str = "claude-haiku-4-5-20251001"
+    # Models (passed to LLMProvider.call — provider decides how to route).
+    # Defaults current as of August 2026: claude-sonnet-5 balances quality and
+    # cost for background extraction/inference/review. Swap for
+    # claude-haiku-4-5 (fastest/cheapest) or claude-opus-5 (highest quality),
+    # or any local model name your provider understands.
+    extraction_model: str = "claude-sonnet-5"
+    inference_model: str = "claude-sonnet-5"
+    review_model: str = "claude-sonnet-5"
 
     # Memory hygiene
     backup_dir: Optional[Path] = None

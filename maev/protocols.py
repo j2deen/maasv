@@ -24,7 +24,7 @@ class LLMProvider(Protocol):
 
         Args:
             messages: Chat messages [{"role": "user", "content": "..."}]
-            model: Model identifier (e.g., "claude-haiku-4-5-20251001")
+            model: Model identifier (e.g., "claude-sonnet-5")
             max_tokens: Maximum tokens in response
             source: Label for tracking/billing (e.g., "entity-extract")
 

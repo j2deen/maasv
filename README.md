@@ -179,10 +179,14 @@ config = MaevConfig(
     embed_dims=1024,                    # Must match your embedding model
     embed_model="qwen3-embedding:8b",   # Recorded in DB to prevent model mismatch
 
-    # Models (names passed to your LLMProvider -- it decides what to do with them)
-    extraction_model="claude-haiku-4-5-20251001",
-    inference_model="claude-haiku-4-5-20251001",
-    review_model="claude-haiku-4-5-20251001",
+    # Models (names passed to your LLMProvider -- it decides what to do with
+    # them). State of the art as of August 2026: claude-sonnet-5 (default,
+    # best quality/cost balance for background extraction), claude-haiku-4-5
+    # (fastest/cheapest), claude-opus-5 (highest quality). Or point these at
+    # a local model for the sensitivity-split pattern below.
+    extraction_model="claude-sonnet-5",
+    inference_model="claude-sonnet-5",
+    review_model="claude-sonnet-5",
 
     # Hygiene tuning
     similarity_threshold=0.95,          # Dedup threshold (cosine)

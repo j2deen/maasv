@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class AnthropicLLM:
     """LLM provider using Anthropic's API."""
 
-    def __init__(self, api_key: str, default_model: str = "claude-haiku-4-5-20251001"):
+    def __init__(self, api_key: str, default_model: str = "claude-sonnet-5"):
         import anthropic
         self._client = anthropic.Anthropic(api_key=api_key)
         self._default_model = default_model

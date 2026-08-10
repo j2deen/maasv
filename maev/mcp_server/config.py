@@ -22,7 +22,7 @@ class MCPSettings(BaseSettings):
     # LLM provider: "anthropic" or "openai"
     llm_provider: str = "anthropic"
     llm_api_key: str = ""
-    llm_model: str = "claude-haiku-4-5-20251001"
+    llm_model: str = "claude-sonnet-5"
 
     # Embedding provider: "ollama" (default), "voyage", or "openai"
     embed_provider: str = "ollama"
