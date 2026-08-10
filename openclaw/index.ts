@@ -95,7 +95,8 @@ export default {
         // Use maev's tiered context — returns pre-prioritized,
         // identity > family > preference > project > relevant content
         const { context } = await client.getContext({
-          query: userMessage,
+          // Server caps query at 2000 chars — longer prompts 422 otherwise.
+          query: userMessage.slice(0, 2000),
           core_limit: config.maxRecallResults,
           relevant_limit: Math.ceil(config.maxRecallResults / 2),
           use_semantic: true,
@@ -259,17 +260,36 @@ function extractUserMessage(event: any): string | null {
   return null;
 }
 
+// Only the newest exchange is worth extracting each turn — earlier messages
+// were captured after their own turns. Re-sending the whole history made
+// extraction take minutes on local models (starving the shared Ollama the
+// chat model runs on) and the oversized output usually failed to parse.
+const CAPTURE_MAX_CHARS = 4000;
+
 function extractConversation(event: any): string | null {
   const messages = resolveEventMessages(event);
   if (!messages) return null;
 
-  const parts: string[] = [];
+  // Walk back to the last user message; capture it plus everything after
+  // (the assistant's reply, including multi-part replies).
+  let start = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      start = i;
+      break;
+    }
+  }
+  if (start === -1) return null;
 
-  for (const msg of messages) {
+  const parts: string[] = [];
+  for (let i = start; i < messages.length; i++) {
+    const msg = messages[i];
     if (msg.role === "user" || msg.role === "assistant") {
       parts.push(`${msg.role}: ${messageContentToText(msg.content)}`);
     }
   }
+  if (parts.length === 0) return null;
 
-  return parts.length > 0 ? parts.join("\n\n") : null;
+  const text = parts.join("\n\n");
+  return text.length > CAPTURE_MAX_CHARS ? text.slice(0, CAPTURE_MAX_CHARS) : text;
 }
