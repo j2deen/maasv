@@ -51,13 +51,10 @@ dev = ["pytest>=8.0", "httpx>=0.27"]
 [project.scripts]
 maasv-mcp = "maasv.mcp_server.server:run"
 maasv-server = "maasv.server.main:run"
-dev = [
-    "pytest>=8.0",
-]
 
 [project.urls]
 Homepage = "https://maasv.com"
-Repository = "https://github.com/ascottbell/maasv"
+Repository = "https://github.com/j2deen/maasv"
 
 [tool.setuptools.packages.find]
 include = ["maasv*"]

@@ -67,6 +67,7 @@ def maasv_db(tmp_path_factory):
         inference_model="test-model",
         review_model="test-model",
         cross_encoder_enabled=False,
+        extra_predicates={"test_pred", "test_rel"},
     )
 
     llm = MockLLMProvider()
@@ -153,9 +154,13 @@ class TestStore:
         assert len(recent) >= 1
 
     def test_supersede_memory(self, maasv_db):
+        import pytest
         from maasv.core.store import store_memory, supersede_memory, get_all_active
         old_id = store_memory(content="Gabby works at BigCorp", category="family", subject="Gabby")
-        new_id = supersede_memory(old_id, "Gabby works at AcmeCo")
+        # "family" is a protected category — superseding requires force=True
+        with pytest.raises(ValueError, match="protected category"):
+            supersede_memory(old_id, "Gabby works at AcmeCo")
+        new_id = supersede_memory(old_id, "Gabby works at AcmeCo", force=True)
         assert new_id != old_id
         active = get_all_active()
         active_ids = {m['id'] for m in active}
