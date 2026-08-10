@@ -141,6 +141,10 @@ maev.init(config, llm, embed)
     +-- server/               REST API server (FastAPI: memory, graph, wisdom,
                               extraction, health routers)
 
+openclaw/                     OpenClaw memory plugin (TypeScript) — talks to
+                              maev-server over HTTP; auto-recall/auto-capture
+                              hooks, memory/graph/wisdom tools, agent skill
+
 evals/                        Dev-only eval harness (not shipped in the package):
                               recall@k / MRR / tokens-injected on a deterministic
                               corpus, with a full-context control arm
@@ -296,6 +300,8 @@ maev-server                           # defaults to 127.0.0.1:18790
 ```
 
 Both configure via `MAEV_`-prefixed environment variables (or a `.env` file): `MAEV_DB_PATH`, `MAEV_LLM_PROVIDER` (`anthropic` or `openai`), `MAEV_LLM_API_KEY`, `MAEV_EMBED_PROVIDER` (`ollama`, `voyage`, or `openai`), and friends. Since the servers own the process, they construct providers for you from those variables — this is where the `anthropic`, `openai`, and `voyage` extras come in.
+
+**OpenClaw plugin** ([`openclaw/`](openclaw/)) gives [OpenClaw](https://openclaw.ai) agents maev-backed long-term memory through the REST server: auto-recall injects tiered memory context before each agent turn, auto-capture runs extraction after each conversation, and the agent gets `memory_search` / `memory_store` / `memory_forget` plus optional graph and wisdom tools. The plugin is the MAEV continuation of Adam Bell's `openclaw-maasv`, vendored here so engine and plugin ship as a single artifact — see [`openclaw/README.md`](openclaw/README.md) for setup.
 
 ## Evals
 
