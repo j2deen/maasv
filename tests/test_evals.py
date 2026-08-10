@@ -17,6 +17,12 @@ class TestEvalHarness:
             "keyword", "paraphrase", "graph_1hop", "graph_2hop"
         }
 
+    def test_corpus_exceeds_vector_window(self, metrics):
+        # RETRIEVAL_DEPTH is 25 at k=5. The corpus must be meaningfully larger,
+        # or vector search sees everything and ranking bugs stay invisible
+        # (exactly what the adversarial review caught on the 30-memory corpus).
+        assert metrics["n_memories"] >= 100
+
     def test_metric_ranges(self, metrics):
         r = metrics["retrieval"]
         for key in ("recall_at_1", "recall_at_5", "mrr"):
@@ -29,10 +35,14 @@ class TestEvalHarness:
         assert metrics["full_context"]["mean_tokens"] > metrics["retrieval"]["mean_tokens"]
 
     def test_regression_floors(self, metrics):
-        # Floors lock in the PPR + RRF-strength gains; deterministic corpus
-        assert metrics["retrieval"]["recall_at_5"] >= 0.9
-        assert metrics["retrieval_by_type"]["keyword"]["recall_at_5"] == 1.0
+        # Floors lock in current performance on the 176-memory corpus
+        # (PPR + bucket-agnostic fusion rescue + diversity selection).
+        # Deterministic corpus, so equality floors are safe.
+        assert metrics["retrieval"]["recall_at_5"] == 1.0
+        assert metrics["retrieval"]["mrr"] >= 0.6
         assert metrics["retrieval_by_type"]["graph_2hop"]["recall_at_5"] == 1.0
+        # Token efficiency: retrieval must stay far below the control arm
+        assert metrics["retrieval"]["mean_tokens"] < metrics["full_context"]["mean_tokens"] / 10
 
     def test_report_renders(self, metrics):
         report = format_report(metrics)

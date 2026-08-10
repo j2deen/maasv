@@ -39,7 +39,11 @@ class MaasvConfig:
     cluster_similarity: float = 0.85
 
     # Retrieval tuning
-    diversity_threshold: float = 0.0  # Jaccard threshold for dedup (0.0 = disabled, 0.7 = moderate)
+    # Jaccard content-overlap ceiling between selected results (0.0 disables).
+    # Default 0.7: near-duplicate memories stop crowding out distinct facts —
+    # on a 176-memory eval corpus, repeated boilerplate otherwise fills 3 of
+    # the top 5 slots for some queries.
+    diversity_threshold: float = 0.7
     graph_slot_injection: bool = False  # Force-inject a graph result into last slot
 
     # Graph retrieval signal: "ppr" (Personalized PageRank, multi-hop; falls back

@@ -948,21 +948,22 @@ def find_similar_memories(
                             result[-1] = best_candidate
 
         # === Fusion rescue ===
-        # Supplementary (no-vector-distance) candidates sort after every
-        # primary candidate, so a rank-1 graph/BM25 hit is unreachable once
-        # the corpus exceeds the vector window. Candidates in the top N of
-        # their own signal claim up to fusion_rescue_slots tail slots,
-        # strongest fused score first.
+        # A rank-1 graph/BM25 hit can be unreachable through importance
+        # scoring: with no vector presence it sorts after every vector
+        # candidate, and with a WEAK vector presence (deep vector rank) it
+        # drowns among lexically-closer matches. Either way, candidates in
+        # the top N of their own signal that didn't make the result claim up
+        # to fusion_rescue_slots tail slots, strongest fused score first.
         rescue_n = config.fusion_rescue_top_n
         rescue_slots = min(config.fusion_rescue_slots, max(0, limit - 1))
-        if rescue_n > 0 and rescue_slots > 0 and supplementary and len(result) >= limit:
+        if rescue_n > 0 and rescue_slots > 0 and len(result) >= limit:
             result_ids = {m['id'] for m in result}
             top_signal_ids = (
                 {r['id'] for r in graph_results[:rescue_n]}
                 | {r['id'] for r in bm25_results[:rescue_n]}
             )
             eligible = sorted(
-                (m for m in supplementary
+                (m for m in candidates
                  if m['id'] not in result_ids and m['id'] in top_signal_ids),
                 key=lambda m: (-(m.get('rrf_score') or 0.0), m['id']),
             )

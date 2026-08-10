@@ -37,7 +37,43 @@ class Corpus:
     qas: list[QA] = field(default_factory=list)
 
 
-def build_corpus() -> Corpus:
+# Distractor templates: plausible workplace noise with deliberate vocabulary
+# overlap (team, project, leads, depends, review, launch, database...) so
+# distractors compete with gold memories in vector and BM25 space. No template
+# mentions a graph entity — distractors add noise, never alternate answers.
+_DISTRACTOR_TEMPLATES = [
+    "Note {i}: the team leads a project review on level {i} every other week",
+    "Reminder {i}: the deploy checklist depends on sign-off from the release team",
+    "Update {i}: database maintenance is scheduled for the {i}th at midnight",
+    "Item {i}: the platform launch retrospective notes are in the shared drive",
+    "Log {i}: the engineer on call rotated after the incident review",
+    "Memo {i}: office desk {i} is reserved for the visiting project manager",
+    "Note {i}: the quarterly security training must be completed by all teams",
+    "Ticket {i}: the build pipeline flaked twice and was retried by the team",
+    "Update {i}: the vendor contract for tooling renews in month {i}",
+    "Item {i}: meeting room {i} has a broken display awaiting repair",
+    "Log {i}: the newsletter goes out after the marketing review approves it",
+    "Memo {i}: expense reports are due before the end of the month",
+    "Note {i}: the intern program review happens each summer with the leads",
+    "Ticket {i}: printer {i} jams when the paper tray is overfilled",
+]
+
+
+def _distractors(count: int) -> list[Memory]:
+    """Deterministic templated noise; category rotates to spread across tiers."""
+    categories = ["history", "project", "person", "learning"]
+    out = []
+    for i in range(count):
+        template = _DISTRACTOR_TEMPLATES[i % len(_DISTRACTOR_TEMPLATES)]
+        out.append(Memory(
+            f"noise{i}",
+            template.format(i=i),
+            categories[i % len(categories)],
+        ))
+    return out
+
+
+def build_corpus(distractor_count: int = 140) -> Corpus:
     memories = [
         # --- Atlas cluster ---
         Memory("priya_leads_atlas", "Priya Sharma leads the Atlas project", "project", "Priya"),
@@ -54,6 +90,14 @@ def build_corpus() -> Corpus:
         Memory("casper_owner", "The data platform team owns the Casper pipeline", "project", "Casper"),
         Memory("casper_nightly", "Casper ingests billing events nightly", "project", "Casper"),
         Memory("casper_airflow", "Elena's team migrated Casper from cron to Airflow in May", "history", "Casper"),
+        # --- Helix cluster ---
+        Memory("dana_helix", "Dana Osei runs the Helix training pipeline", "project", "Dana"),
+        Memory("helix_k8s", "Helix runs on Kubernetes in the eu-west cluster", "project", "Helix"),
+        Memory("helix_weekly", "Helix retrains ranking models every Sunday night", "project", "Helix"),
+        # --- Quill cluster ---
+        Memory("sam_quill", "Sam Porter created the Quill documentation generator", "project", "Sam"),
+        Memory("quill_ts", "Quill is written in TypeScript", "project", "Quill"),
+        Memory("quill_cf", "Quill is hosted on Cloudflare Workers", "project", "Quill"),
         # --- Preferences / person facts ---
         Memory("priya_async", "Priya prefers async communication over meetings", "preference", "Priya"),
         Memory("elena_espresso", "Elena drinks a double espresso every morning before standup", "person", "Elena"),
@@ -81,14 +125,21 @@ def build_corpus() -> Corpus:
         ("Marcus", "person"),
         ("Elena", "person"),
         ("Sofia", "person"),
+        ("Dana", "person"),
+        ("Sam", "person"),
         ("Atlas", "project"),
         ("Beacon", "project"),
         ("Casper", "project"),
         ("Zephyr", "project"),
+        ("Helix", "project"),
+        ("Quill", "project"),
         ("Rust", "technology"),
         ("Kotlin", "technology"),
         ("Postgres", "technology"),
         ("Airflow", "technology"),
+        ("Kubernetes", "technology"),
+        ("TypeScript", "technology"),
+        ("Cloudflare", "technology"),
         ("Toronto", "place"),
     ]
 
@@ -102,6 +153,11 @@ def build_corpus() -> Corpus:
         ("Elena", "manages", "Casper"),
         ("Casper", "runs_on", "Airflow"),
         ("Sofia", "works_on", "Beacon"),
+        ("Dana", "manages", "Helix"),
+        ("Helix", "runs_on", "Kubernetes"),
+        ("Sam", "created", "Quill"),
+        ("Quill", "written_in", "TypeScript"),
+        ("Quill", "hosted_on", "Cloudflare"),
     ]
 
     qas = [
@@ -119,10 +175,17 @@ def build_corpus() -> Corpus:
         QA("Who works on the project written in Rust?", ["priya_leads_atlas", "atlas_rust"], "graph_1hop"),
         QA("Which project does the Toronto-based engineer work on?", ["marcus_beacon"], "graph_1hop"),
         QA("What pipeline does Elena's team look after?", ["casper_owner", "elena_platform"], "graph_1hop"),
+        QA("What schedule does Helix retrain on?", ["helix_weekly"], "keyword"),
+        QA("Which developer built the docs generator?", ["sam_quill"], "paraphrase"),
+        QA("Where is the Helix pipeline deployed?", ["helix_k8s"], "graph_1hop"),
         # Graph 2-hop: gold subject is two hops from the only entity in the query
         QA("Who leads the project that depends on Postgres?", ["priya_leads_atlas"], "graph_2hop"),
         QA("Which person's project is built with Kotlin?", ["marcus_beacon"], "graph_2hop"),
         QA("Who manages the pipeline that runs on Airflow?", ["elena_platform", "casper_owner"], "graph_2hop"),
+        QA("Who runs the thing deployed on Kubernetes?", ["dana_helix"], "graph_2hop"),
+        QA("Who created the tool written in TypeScript?", ["sam_quill"], "graph_2hop"),
     ]
+
+    memories.extend(_distractors(distractor_count))
 
     return Corpus(memories=memories, entities=entities, relationships=relationships, qas=qas)
